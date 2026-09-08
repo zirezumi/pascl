@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pascl"
+dynamic = ["version"]
+description = "PASCL: a presence-adaptive, solar-circadian lighting compositor."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+authors = [{ name = "zirezumi" }]
+keywords = ["lighting", "home-assistant", "circadian", "presence", "zigbee"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Home Automation",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/zirezumi/pascl"
+Issues = "https://github.com/zirezumi/pascl/issues"
+
+[project.scripts]
+pascl = "pascl.cli:main"
+
+[tool.hatch.version]
+path = "src/pascl/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pascl"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/pascl", "tests", "docs", "README.md", "LICENSE", "NOTICE", "CLA.md", "CONTRIBUTING.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["pascl"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -ra"
+xfail_strict = true
