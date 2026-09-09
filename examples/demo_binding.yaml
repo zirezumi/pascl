@@ -1,0 +1,59 @@
+# How the synthetic demo home's recording names things. A binding is per installation: the
+# patterns turn a model id into the host's entity ids and command topics, so the engine never
+# learns a host name. This one follows the naming convention of a Home Assistant host driving
+# Zigbee2MQTT, with helpers named after the room or fixture they belong to.
+binding:
+  version: 0
+  fixture:
+    light: "light.{fixture}"
+    command_topic: "{base_topic}/{address}/set"
+    brightness_factor: "input_number.{fixture}_brightness_factor"
+    color_factor: "input_number.{fixture}_color_factor"
+    color_override_x: "input_number.{fixture}_color_override_x"
+    color_override_y: "input_number.{fixture}_color_override_y"
+    color_override_kelvin: "input_number.{fixture}_color_override_kelvin"
+    color_override_is_ct: "input_boolean.{fixture}_color_override_is_ct"
+    held_off: "input_boolean.{fixture}_held_off"
+    scene_x: "input_number.{fixture}_x"
+    scene_y: "input_number.{fixture}_y"
+    intent_brightness: "input_number.{fixture}_brightness_intent_cache"
+    intent_x: "input_number.{fixture}_x_intent_cache"
+    intent_y: "input_number.{fixture}_y_intent_cache"
+    intent_ct_mode: "input_boolean.{fixture}_color_temp_mode_state_intent_cache"
+    intent_kelvin: "input_number.{fixture}_color_temp_kelvin_intent_cache"
+    baseline_target: "input_number.{fixture}_baseline_target"
+    last_published: "input_number.{fixture}_brightness_last_published"
+  group:
+    command_topic: "{base_topic}/{address}/set"
+  room:
+    presence: "binary_sensor.{room}_presence"
+    switch_zone: "binary_sensor.{room}_switch_presence"
+    multiplier: "input_number.{room}_brightness_multiplier"
+    vacancy_timer: "timer.{room}_vacancy"
+    hold_active: "input_boolean.{room}_switch_hold_active"
+    on_override: "input_boolean.{room}_on_override"
+    hold_ms: "input_number.{room}_presence_hold_ms"
+  scene_group:
+    selector: "input_select.{scene_group}_scene_selector"
+  ambient_scope:
+    drive: "input_boolean.pascl_ambient_drive_{scope}"
+    coupling: "sensor.ambient_fusion_{scope}#coupling"
+  global:
+    solar_progress: "sensor.sol_normalized_p"
+    solar_factor: "sensor.sol_factor"
+    solar_ready: "binary_sensor.sol_ready"
+    solar_anchor_pct: "sensor.sol_{anchor}_normalized_pct"
+    sleep: "input_boolean.eeptime"
+    scene_offset: "input_number.scene_engine_global_offset"
+    palette_json: "input_text.palette_{palette}_json"
+    scene_transition_s: "input_number.light_scene_transition_time"
+    scene_linger_s: "input_number.light_scene_linger_time"
+    ambient_accumulator: "input_number.pascl_ambient_normalization_accumulator"
+    ambient_weather: "input_boolean.pascl_ambient_weather_enable"
+    main_space_vacancy_timer: "timer.main_space_vacancy"
+  palette_names:
+    Natural White: natural_white
+    Natural Color: natural_color
+    Warm: warm
+    Dusk: dusk
+  overrides: {}

@@ -33,9 +33,10 @@ Python 3.12 or newer. CI runs the same checks on 3.12 and 3.13 and builds the co
 Two test modules run only against private fixtures that never enter this repository, because
 they carry the reference home's coordinates and topology: `tests/test_solar_golden.py` reads
 `solar_*.json` snapshots from the directory named by `PASCL_PRIVATE_GOLDEN`, and
-`tests/test_model_private.py` reads Home Models from `PASCL_PRIVATE_MODELS`. Without those
-variables they are skipped, which is what CI does; the public `examples/` home covers the same
-code paths.
+`tests/test_model_private.py` reads Home Models from `PASCL_PRIVATE_MODELS`, and
+`tests/test_assemble_private.py` assembles recorded exports from `PASCL_PRIVATE_TRACES` under the
+binding found beside the models. Without those variables they are skipped, which is what CI does;
+the public `examples/` home and binding cover the same code paths.
 
 ## Rules the tests enforce
 

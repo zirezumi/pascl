@@ -15,7 +15,14 @@ import pytest
 from pascl.model import consumer_envelopes, dumps, from_dict, load, loads, to_dict, validate
 
 MODEL_DIR = os.environ.get("PASCL_PRIVATE_MODELS")
-FILES = sorted(Path(MODEL_DIR).glob("*.yaml")) if MODEL_DIR else []
+
+
+def _is_model(path: Path) -> bool:
+    with path.open(encoding="utf-8") as f:
+        return any(line.startswith("home_model:") for line in f)
+
+
+FILES = sorted(p for p in Path(MODEL_DIR).glob("*.yaml") if _is_model(p)) if MODEL_DIR else []
 
 pytestmark = pytest.mark.skipif(not FILES, reason="PASCL_PRIVATE_MODELS not set or holds no *.yaml")
 
