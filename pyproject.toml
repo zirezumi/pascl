@@ -24,10 +24,10 @@ classifiers = [
 # astral is pinned to the major version Home Assistant ships, because the reference installation
 # computes its anchors with it and the shadow diff must not carry a library's drift (3.x moves
 # solar midnight by ~10 s). Upgrading is a dated amendment, not a routine bump.
-dependencies = ["astral>=2.2,<3"]
+dependencies = ["astral>=2.2,<3", "pyyaml>=6"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11"]
+dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11", "types-PyYAML"]
 
 [project.urls]
 Homepage = "https://github.com/zirezumi/pascl"

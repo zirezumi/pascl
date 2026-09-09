@@ -1,0 +1,113 @@
+# A small synthetic home that exercises every section of schema v0. It is not a real place.
+# Two rooms: a main-space den on a Zigbee2MQTT transport with a plate, a switch-proximity zone
+# and two scene groups; and a pantry, a non-main room whose presence is a motion-seeded latch
+# and whose occupancy sensor arrives pre-fused through a Home Assistant bridge.
+home_model:
+  version: 0
+  id: demo
+  location: { latitude: 47.61, longitude: -122.33, elevation_m: 50, tz: America/Los_Angeles }
+  solar: { solstice_blend_frac: 0.775, tick_s: 45 }
+
+  transports:
+    z2m-1: { kind: z2m, attribution: none, endpoint: mqtt://broker.local:1883, base_topic: z2m-1 }
+    ha:    { kind: ha_bridged, attribution: inferred }
+
+  calibrations:
+    hue_bulb:  { warm_xy: [0.530, 0.410], cool_xy: [0.438, 0.405], night_xy: [0.574, 0.390] }
+    hue_strip: { warm_xy: [0.514, 0.410], cool_xy: [0.427, 0.380], night_xy: [0.542, 0.397] }
+
+  materials:
+    color_bulb:  { kind: bulb,  capabilities: [dim, cct, xy], cct_range_k: [2000, 6535], calibration: hue_bulb,  model: demo colour bulb }
+    color_strip: { kind: strip, capabilities: [dim, xy],                                   calibration: hue_strip, model: demo strip }
+    white_bulb:  { kind: bulb,  capabilities: [dim, cct],     cct_range_k: [2200, 6500], calibration: hue_bulb }
+
+  sensors:
+    den_plate_mmwave_1: { modality: inovelli_mmwave, transport: z2m-1, device: den_plate, zone: "1", address: den_plate/area1 }
+    den_plate_mmwave_3: { modality: inovelli_mmwave, transport: z2m-1, device: den_plate, zone: "3", address: den_plate/area3 }
+    den_radar_zone_1:   { modality: s1_zone,          transport: ha,    device: den_radar,  zone: "1", address: binary_sensor.den_radar_zone_1 }
+    den_plate_lux:      { modality: lux,              transport: z2m-1, device: den_plate,             address: den_plate/illuminance }
+    pantry_pir:         { modality: pir,              transport: z2m-1, device: pantry_motion,          address: pantry_motion/occupancy }
+    pantry_occupancy:   { modality: generic,          transport: ha,                                    address: binary_sensor.pantry_occupancy }
+    pantry_pir_lux:     { modality: lux,              transport: z2m-1, device: pantry_motion,          address: pantry_motion/illuminance }
+
+  rooms:
+    den:
+      class: main
+      vacancy: { scope: main_space, seconds: 600 }
+      presence:
+        sources: [den_plate_mmwave_1, den_radar_zone_1]
+        fusion: or
+        coalesce_ms: 100
+      switch_zone:
+        sources: [den_plate_mmwave_3]
+        fusion: or
+      fixtures:
+        den_pendant_1: { material: color_bulb,  curve: pendant, role: accent,    transport: z2m-1, address: den_pendant_1, scene_group: den_accents,    palette_stride: 0 }
+        den_pendant_2: { material: color_bulb,  curve: pendant, role: accent,    transport: z2m-1, address: den_pendant_2, scene_group: den_accents,    palette_stride: 31 }
+        den_strip:     { material: color_strip, curve: strip,   role: highlight, transport: z2m-1, address: den_strip,     scene_group: den_highlights, palette_stride: 62 }
+      groups:
+        den:          { members: [den_pendant_1, den_pendant_2, den_strip], tier: room,    transport: z2m-1, address: den }
+        den_bulbs:    { members: [den_pendant_1, den_pendant_2],            tier: type,    transport: z2m-1, address: den_bulbs }
+        den_phantom:  { members: [den_plate],                               tier: phantom, transport: z2m-1, address: den_phantom }
+      curves:
+        pendant:
+          occupied: { midnight: 25, pre_dawn_mid: 40, civil_dawn: 90, am_mid: 120, noon: 165, pm_mid: 120, civil_dusk: 100, pre_midnight_mid: 70 }
+          vacant:   { midnight: 15, pre_dawn_mid: 30, civil_dawn: 60, am_mid: 85,  noon: 100, pm_mid: 85,  civil_dusk: 70,  pre_midnight_mid: 30 }
+        strip:
+          occupied: { midnight: 35, pre_dawn_mid: 50, civil_dawn: 95, am_mid: 175, noon: 215, pm_mid: 175, civil_dusk: 95, pre_midnight_mid: 50 }
+          vacant:   { midnight: 10, pre_dawn_mid: 20, civil_dawn: 50, am_mid: 65,  noon: 110, pm_mid: 65,  civil_dusk: 45, pre_midnight_mid: 20 }
+      scene_groups:
+        den_accents:    { fixtures: [den_pendant_1, den_pendant_2], default: natural_white, parents: [den, house] }
+        den_highlights: { fixtures: [den_strip],                    default: natural_white, parents: [den, house] }
+      palette_base: 4507
+      control_surfaces:
+        den_plate: { kind: inovelli_vzm32, transport: z2m-1, address: den_plate, presence_zone: switch, phantom_group: den_phantom, led_tier: A, smart_bulb_binding: true }
+      ambient_scope: den
+      sleep: suppress
+
+    pantry:
+      class: non_main
+      pattern: A
+      vacancy: { scope: room, seconds: 15 }
+      presence:
+        sources: [pantry_pir, pantry_occupancy]
+        fusion: or_pir_latched
+        pir: pantry_pir
+        coalesce_ms: null
+      fixtures:
+        pantry_light: { material: white_bulb, curve: ceiling, role: highlight, transport: z2m-1, address: pantry_light, scene_group: pantry }
+      curves:
+        ceiling:
+          occupied: { midnight: 45, pre_dawn_mid: 75, civil_dawn: 105, am_mid: 180, noon: 255, pm_mid: 215, civil_dusk: 170, pre_midnight_mid: 110 }
+          vacant:   { midnight: 20, pre_dawn_mid: 65, civil_dawn: 90,  am_mid: 165, noon: 240, pm_mid: 170, civil_dusk: 115, pre_midnight_mid: 75 }
+      scene_groups:
+        pantry: { fixtures: [pantry_light], default: natural_white }
+      palette_base: 5003
+      ambient_scope: pantry
+      sleep: suppress
+
+  lux:
+    pools:
+      den:    [den_plate_lux]
+      pantry: [pantry_pir_lux]
+    borrow: {}
+
+  ambient_scopes:
+    den:    { rooms: [den],    lux_pool: den,    drive: true }
+    pantry: { rooms: [pantry], lux_pool: pantry, drive: true }
+
+  ambient_normalization: { weather_data: true, cap: 1.20, deadband: 0.15, dose_k: 0.6, tau_s: 3000, elevation_gate_deg: 12 }
+
+  scenes:
+    palettes:
+      natural_white: { kind: solar_cct }
+      natural_color: { kind: solar_keyframes }
+      warm:          { kind: solar_cct_offset, offset_k: 275 }
+      dusk:
+        kind: static
+        bulbs:  [[0.532, 0.222], [0.621, 0.358], [0.671, 0.309]]
+        strips: [[0.652, 0.290], [0.686, 0.304], [0.611, 0.358]]
+    parents:
+      den:   [den_accents, den_highlights]
+      house: [den_accents, den_highlights]
+    tick: { linger_s: 30, transition_s: 30, fast_transition_s: 0.2, offset_wrap: 6400 }
