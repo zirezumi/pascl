@@ -21,7 +21,10 @@ classifiers = [
   "Topic :: Home Automation",
   "Typing :: Typed",
 ]
-dependencies = []
+# astral is pinned to the major version Home Assistant ships, because the reference installation
+# computes its anchors with it and the shadow diff must not carry a library's drift (3.x moves
+# solar midnight by ~10 s). Upgrading is a dated amendment, not a routine bump.
+dependencies = ["astral>=2.2,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11"]
@@ -56,6 +59,10 @@ strict = true
 mypy_path = "src"
 packages = ["pascl"]
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["astral", "astral.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
