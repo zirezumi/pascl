@@ -23,16 +23,18 @@ TRIANGLE: Polygon = ((0.153185, 0.047547), (0.691493, 0.308293), (0.169986, 0.69
 
 
 class LoadedCoordinator:
-    """Devices that clip to a triangle, on a coordinator that queues: a read answers after
-    base_delay x (fixtures on the air)^2 seconds, so the latency climbs steeply with the
-    number in flight."""
+    """Devices that clip to a triangle, on a coordinator that queues: every read is airtime,
+    and a read answers after base_delay x (reads outstanding, this one included)^2 seconds,
+    so the latency climbs steeply with the number of fixtures reading at once."""
 
-    def __init__(self, names: list[str], *, base_delay: float) -> None:
+    def __init__(self, names: list[str], *, base_delay: float, deaf_until: float = 0.0) -> None:
         self.names = names
         self.base_delay = base_delay
+        #: colour reads before this monotonic instant go unanswered: a coordinator that is away
+        self.deaf_until = deaf_until
         self.q: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
         self.current: dict[str, tuple[float, float]] = {}
-        self.busy: set[str] = set()
+        self.outstanding = 0
         self.lock = threading.Lock()
         self.max_seen = 0
         self.subscribed: list[str] = []
@@ -47,15 +49,14 @@ class LoadedCoordinator:
             xy = (float(body["color"]["x"]), float(body["color"]["y"]))
             with self.lock:
                 self.current[name] = project(xy, TRIANGLE)
-                # a probe (integer zero transition) puts the fixture on the air until its read
-                # is answered; the restore at the end of a measurement is not a probe
-                if isinstance(body.get("transition"), int):
-                    self.busy.add(name)
-                    self.max_seen = max(self.max_seen, len(self.busy))
             self.q.put((base, json.dumps({"color": body["color"], "state": "OFF"})))
         elif verb == "get":
+            if "state" not in body and time.monotonic() < self.deaf_until:
+                return  # a sample's colour read goes unanswered; the snapshot still answers
             with self.lock:
-                on_air = len(self.busy)
+                self.outstanding += 1
+                on_air = self.outstanding
+                self.max_seen = max(self.max_seen, on_air)
                 x, y = self.current.get(name, (0.4, 0.4))
             delay = self.base_delay * on_air * on_air
 
@@ -68,7 +69,7 @@ class LoadedCoordinator:
                     )
                 )
                 with self.lock:
-                    self.busy.discard(name)
+                    self.outstanding -= 1
 
             threading.Thread(target=answer, daemon=True).start()
 
@@ -114,21 +115,27 @@ def test_window_grows_on_prompt_answers_and_backs_off_on_a_retry() -> None:
     assert w.slots == 4 and w.peak == 4  # the ceiling holds
 
 
-def test_measure_adaptively_finds_the_coordinators_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _quick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timing rules shortened so the suite stays quick; the retry interval leaves room for
+    an answer to land, as the real one does."""
     from pascl.shell import airtime, gamut_measure
 
     monkeypatch.setattr(gamut_measure, "READ_AFTER", 0.02)
-    monkeypatch.setattr(gamut_measure, "READ_RETRY", 0.12)
+    monkeypatch.setattr(gamut_measure, "READ_RETRY", 0.3)
     monkeypatch.setattr(gamut_measure, "ANSWER_TIMEOUT", 0.8)
     monkeypatch.setattr(gamut_measure, "PAUSE", 0.01)
     monkeypatch.setattr(gamut_measure, "POLL", 0.02)
     monkeypatch.setattr(gamut_measure, "MIN_WAIT", 0.005)
     monkeypatch.setattr(airtime, "LATENCY_BUDGET", 0.1)
+
+
+def test_measure_adaptively_finds_the_coordinators_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _quick(monkeypatch)
     names = [f"f{i}" for i in range(6)]
-    # 0.02 s x (on the air)^2: one or two on the air answer inside the budget, three do not
-    base = LoadedCoordinator(names, base_delay=0.02)
+    # 0.01 s x (reads outstanding)^2: one or two answer inside the budget, three do not
+    base = LoadedCoordinator(names, base_delay=0.01)
     hub = Hub(base)
     channels = {n: Z2MDeviceChannel(hub.view(), f"z2m-1/{n}/set", identity=n) for n in names}
     launches: list[tuple[str, int, int]] = []
@@ -148,13 +155,42 @@ def test_measure_adaptively_finds_the_coordinators_capacity(
         for hidden in TRIANGLE:
             assert min(abs(hidden[0] - p[0]) + abs(hidden[1] - p[1]) for p in v.polygon) < 1e-5
     w = report["z2m-1"]
-    # the window grew from one on prompt answers and backed off when three or four on the air
-    # pushed the latency past the budget, so the air never carried more than four (a read
-    # issued while others sit between samples sees a quieter air, and once the last fixtures
-    # are alone the window may climb again with nothing left to launch); every launch
-    # respected the window of its moment
+    # the window grew from one on prompt answers and backed off when a third read on the air
+    # pushed the latency past the budget, so the air never carried more than three reads at
+    # once (four allowed: a retry can join the third before the backoff lands), then climbed
+    # again once fixtures finished; every launch respected the window of its moment
     assert w.increases >= 1 and w.peak >= 2 and w.decreases >= 1
     assert base.max_seen <= 4
     assert all(f <= win for _n, f, win in launches)
     assert launches[0] == ("f0", 1, 1)
     assert w.samples >= 24 * len(names)
+
+
+def test_a_fixture_given_up_on_for_silence_is_tried_again_at_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The coordinator is away for the first two seconds: the first fixture's opening samples
+    get no answer and the measurement gives up on it as not reachable. That is what a
+    transport the window has just backed off from looks like too, so the fixture goes to
+    the back of its queue once, and is measured when its turn comes round again."""
+    _quick(monkeypatch)
+    names = ["f0", "f1"]
+    base = LoadedCoordinator(names, base_delay=0.01, deaf_until=time.monotonic() + 2.0)
+    hub = Hub(base)
+    channels = {n: Z2MDeviceChannel(hub.view(), f"z2m-1/{n}/set", identity=n) for n in names}
+    launches: list[str] = []
+    hub.start()
+    try:
+        results, _report = measure_adaptively(
+            channels,
+            dict.fromkeys(names, "z2m-1"),
+            ceiling=2,
+            on_launch=lambda n, _f, _w: launches.append(n),
+        )
+    finally:
+        hub.stop()
+    assert launches == ["f0", "f1", "f0"]
+    for n in names:
+        v = results[n]
+        assert not isinstance(v, BaseException) and v is not None
+        assert v.polygon is not None and v.aborted is None, (n, v.notes)

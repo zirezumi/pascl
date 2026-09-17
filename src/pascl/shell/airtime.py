@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from pascl.estimator.gamut import Verdict
-from pascl.shell.gamut_measure import DeviceChannel, Sample, measure
+from pascl.shell.gamut_measure import NO_READ_ANSWER, DeviceChannel, Sample, measure
 
 #: A first-read answer slower than this is a transport that is starting to queue.
 LATENCY_BUDGET: Final = 0.6
@@ -114,7 +114,10 @@ def measure_adaptively(
     """Measure every channel, admitting fixtures per key as that key's window allows. Returns
     each fixture's verdict (None for a lit fixture not allowed, the exception when one was
     raised) and a report per key. ``on_launch(name, in_flight_on_key, window)`` is told of
-    every launch. The hub carrying the channels must be running."""
+    every launch. A fixture the measurement gave up on because its opening read-backs went
+    unanswered is tried once more at the end of its key's queue, since a transport the
+    window has just backed off from looks exactly like a device that is not reachable. The
+    hub carrying the channels must be running."""
     windows: dict[str, Window] = {
         k: Window(size=float(max(1, start)), ceiling=max(1, ceiling)) for k in set(keys.values())
     }
@@ -125,6 +128,7 @@ def measure_adaptively(
         pending.setdefault(keys.get(name, ""), []).append(name)
     windows.setdefault("", Window(size=float(max(1, start)), ceiling=max(1, ceiling)))
     in_flight: dict[str, int] = dict.fromkeys(windows, 0)
+    retried: set[str] = set()
 
     def one(name: str, channel: DeviceChannel) -> Verdict | BaseException | None:
         key = keys.get(name, "")
@@ -162,9 +166,22 @@ def measure_adaptively(
             done, _ = wait(list(running), timeout=poll_s, return_when=FIRST_COMPLETED)
             for fut in done:
                 name = running.pop(fut)
-                results[name] = fut.result()
+                result = fut.result()
+                results[name] = result
+                key = keys.get(name, "")
                 with lock:
-                    in_flight[keys.get(name, "")] -= 1
+                    in_flight[key] -= 1
+                    # a fixture whose opening read-backs went unanswered was diagnosed as
+                    # not reachable, but a transport this window has just backed off from
+                    # looks the same: it goes to the back of its queue once, for quieter air
+                    if (
+                        isinstance(result, Verdict)
+                        and result.aborted is not None
+                        and result.aborted.startswith(NO_READ_ANSWER)
+                        and name not in retried
+                    ):
+                        retried.add(name)
+                        pending.setdefault(key, []).append(name)
     report = {
         key: WindowReport(
             key,
