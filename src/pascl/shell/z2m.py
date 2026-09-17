@@ -175,6 +175,34 @@ def _near(a: XY, b: XY, tol: float = ECHO_TOL) -> bool:
     return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
 
 
+def _commands_on(raw: str) -> bool:
+    """A ``/set`` payload that turns the light on (``state: ON``, any endpoint)."""
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip().upper() == "ON"
+    if not isinstance(body, dict):
+        return False
+    return any(k == "state" or k.startswith("state_") for k, v in body.items() if v == "ON")
+
+
+def _means_occupied(raw: str) -> bool:
+    """An occupancy message: a relayed entity state ``on`` (bare, or JSON with ``state``), or
+    a sensor's own ``occupancy``/``presence`` true."""
+    text = raw.strip()
+    if text.lower() == "on":
+        return True
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    if str(body.get("state", "")).lower() == "on":
+        return True
+    return any(body.get(k) is True for k in ("occupancy", "presence"))
+
+
 class Z2MDeviceChannel:
     """One Zigbee2MQTT light (or one endpoint of one) as a :class:`DeviceChannel`."""
 
@@ -185,10 +213,15 @@ class Z2MDeviceChannel:
         identity: str | None = None,
         *,
         watch: Iterable[str] = (),
+        occupancy: Iterable[str] = (),
     ) -> None:
         """``watch`` names further ``/set`` topics whose commands reach this device without
         touching its own topic: the groups it belongs to. A command on any of them during a
-        sample is foreign, exactly like one on the device's own topic."""
+        sample is foreign, exactly like one on the device's own topic, and one that carries
+        ``state: ON`` is the fixture being turned on. ``occupancy`` names topics whose message
+        means the room this fixture lights has become occupied (a presence entity's state
+        relayed by the link as ``on``, or a sensor's own ``occupancy: true``): the earliest
+        warning of the render that will turn the fixture on."""
         self._link = link
         self._set_topic = set_topic
         self._base, self._ep = split_set_topic(set_topic)
@@ -198,14 +231,16 @@ class Z2MDeviceChannel:
         self._info: DeviceInfo | None = None
         self._sent: list[str] = []
         self._command: XY | None = None
+        self._pre_command: XY | None = None
         self._read_sent = False
         self._seen_unsuffixed: list[XY] = []
         self._before: dict[str, object] | None = None
         self._last_seen: XY | None = None
         self._watch = frozenset(watch) - {set_topic}
+        self._occupancy = frozenset(occupancy)
         link.subscribe(self._base)
         link.subscribe(self._set_topic)
-        for topic in sorted(self._watch):
+        for topic in sorted(self._watch | self._occupancy):
             link.subscribe(topic)
 
     @property
@@ -215,6 +250,10 @@ class Z2MDeviceChannel:
     @property
     def firmware(self) -> str | None:
         return self._firmware
+
+    @property
+    def needs_lit(self) -> bool:
+        return False  # a colour reaches a dark device, and one that ignores it stays dark
 
     @property
     def info(self) -> DeviceInfo | None:
@@ -285,17 +324,17 @@ class Z2MDeviceChannel:
             return None
         return view.get("state") == "ON"
 
-    def restore(self) -> None:
+    def restore(self, transition: float = 0.2) -> None:
         before = self._before
         if before is None:
             return
         if before.get("color_mode") == "color_temp" and before.get("color_temp") is not None:
-            payload = {"color_temp": before["color_temp"], "transition": 0.2}
+            payload = {"color_temp": before["color_temp"], "transition": transition}
         else:
             xy = _xy(before, "color")
             if xy is None:
                 return
-            payload = {"color": {"x": xy[0], "y": xy[1]}, "transition": 0.2}
+            payload = {"color": {"x": xy[0], "y": xy[1]}, "transition": transition}
         self._link.publish(self._set_topic, json.dumps(payload))
 
     # -- the sample --------------------------------------------------------------------------
@@ -304,6 +343,7 @@ class Z2MDeviceChannel:
         payload = json.dumps({"color": {"x": xy[0], "y": xy[1]}, "transition": 0})
         self._sent.append(payload)
         self._command = xy
+        self._pre_command = self._last_seen
         self._read_sent = False
         self._seen_unsuffixed = []
         self._link.publish(self._set_topic, payload)
@@ -315,12 +355,16 @@ class Z2MDeviceChannel:
     def observe(self, seconds: float) -> list[Observation]:
         out: list[Observation] = []
         for topic, raw in self._link.drain(seconds):
-            if topic == self._set_topic:
-                if raw not in self._sent:
-                    out.append(Observation("foreign"))
-                continue
-            if topic in self._watch:
+            if topic == self._set_topic or topic in self._watch:
+                if topic == self._set_topic and raw in self._sent:
+                    continue
                 out.append(Observation("foreign"))
+                if _commands_on(raw):
+                    out.append(Observation("lit"))
+                continue
+            if topic in self._occupancy:
+                if _means_occupied(raw):
+                    out.append(Observation("occupied"))
                 continue
             if topic != self._base:
                 continue
@@ -375,5 +419,13 @@ class Z2MDeviceChannel:
                 return Observation("echo")
             if self._last_seen is not None and _near(value, self._last_seen):
                 return None  # the colour it already showed: not an answer to this command
+        elif (
+            self._pre_command is not None
+            and _near(value, self._pre_command)
+            and not _near(value, cmd)
+        ):
+            # the read landed before the device applied the command: it still shows what it
+            # showed before, and the driver reads again
+            return None
         self._last_seen = value
         return Observation("device", value, trusted=self._read_sent)

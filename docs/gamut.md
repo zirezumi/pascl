@@ -121,6 +121,7 @@ On the reference installation every unit of every label measured the identical p
 labels, up to nine units each, max vertex deviation 0.000000), so a seed has never been wrong
 there. It is still a seed, because the measurement is cheap and the label is only a label.
 
+
 ## 5. When the runtime measures (`statuses`, `pick_target`, `pascl.shell.gamut_runtime`)
 
 The runtime keeps a status per colour fixture: `measured`, `inherited`, `unmeasured`, or
@@ -131,20 +132,35 @@ an empty room is invisible and self-restoring, which is what lets the runtime do
 own, the way its daylight calibrator takes empty-and-dark windows. A gamut does not drift, so
 staleness is device identity, not age.
 
+**Invisible, or forced.** A dark fixture holds each probe colour only for the length of a
+sample (a read-back 0.4 s after the command, re-read if the device has not applied it yet; a
+fixture takes about fifteen seconds). Three things end a measurement early, restore the fixture
+to its intended colour with *no* transition, and withhold the polygon: the room's presence
+entity turning on (watched through the host, ahead of the render that follows presence), a
+command that turns the fixture on (a foreign `state: ON` on its own topic or any group it is
+in), and the device reporting itself on. So a fixture turned on during a measurement comes on
+at its intended colour, except for the one path that gives no warning, a switch bound straight
+to the bulb, where the probe colour shows until the state report arrives (a few hundred
+milliseconds). The forced mode (`--force`) measures whatever the fixture's state and whoever
+is in the room, visibly; a transport that cannot carry colour to a dark fixture (section 7's
+entity channel) is measured in that mode only.
+
 `pascl.shell.gamut_runtime.tick` is one pass: read the host through the binding (which light
 entities are on, which presence entities are on), read each coordinator's device list, pick,
-measure with the room's presence watched for an abort, refuse a record the model would not
-validate with, write the model, let the measurement travel. `run` is the loop.
+reach the fixture the way its transport allows (`channel_for`), measure with the room's
+presence watched, refuse a record the model would not validate with, write the model, let the
+measurement travel. `run` is the loop; a fixture a tick sets aside (no way in, or forced mode
+only) is not picked again in that run.
 
     HA_TOKEN=... pascl gamut auto --model home.yaml --binding binding.yaml \
-        --ha-url http://homeassistant:8123 --write home.yaml [--interval 300] [--once]
+        --ha-url http://homeassistant:8123 --write home.yaml [--interval 300] [--once] [--force]
 
 `pascl gamut status --model F [--device-ids TSV]`, `pascl gamut pick ...`, `pascl gamut
 inherit ...` and `pascl gamut plan` are the pure views from the command line; `pascl gamut ids`
 prints every fixture's device identity, model id and firmware from the coordinators, in the
 shape `status` and `pick` take.
 
-## 6. Device identity (`pascl.shell.z2m`)
+## 6. Device identity (`pascl.shell.z2m`, `pascl.shell.ha_light`)
 
 The identity a polygon is bound to is the device's IEEE address as its Zigbee2MQTT coordinator
 lists it in the retained `bridge/devices`, suffixed with the endpoint for a fixture that is one
@@ -152,28 +168,65 @@ endpoint of a device. A topic is a name the user can change; the address survive
 changes with the hardware, which is exactly what a bound polygon needs. The same list carries
 the firmware build, recorded with the measurement as information for a reader comparing units,
 never as a staleness trigger. The retained `bridge/groups` names the groups a device belongs
-to, whose `/set` topics the measurement watches as foreign.
+to, whose `/set` topics the measurement watches as foreign. A light reached through a host
+entity is bound to the entity registry's `unique_id` (a Matter node, a bridge's light id),
+with the device registry's software version as its firmware.
 
-## 7. Running one measurement (`pascl.shell`)
+## 7. Running measurements (`pascl.shell`): channels, links, the hub
 
-`pascl.shell.gamut_measure` drives a `Probe` over a `DeviceChannel` with the timing rules
-(read back after 1 s without a report, a 1.5 s settle after the first device value, a 6 s
-ceiling, a re-take after a foreign command), against the injected clock, and restores the
-fixture whatever happens. `pascl.shell.z2m` is the Zigbee2MQTT channel: the `/set` and `/get`
-topics, the echo and read-back rules, the endpoint rule, the foreign-command and lit guards,
-snapshot and restore, over an injected MQTT link. `pascl.shell.ha_mqtt` is one such link,
-through Home Assistant's REST `mqtt.publish` and `mqtt/subscribe` WebSocket
-(`pip install pascl[ha]`); `pascl.shell.paho_mqtt` is the other, straight to a broker
-(`pip install pascl[mqtt]`).
+The measurement talks to a fixture through a `DeviceChannel` (command a colour, read it back,
+observe, restore, identity, firmware, whether a dark fixture can be reached). Two channels
+exist:
+
+* `pascl.shell.z2m`, one Zigbee2MQTT light or endpoint: the `/set` and `/get` topics, the echo
+  and read-back rules, the endpoint rule, the foreign-command, lit and occupancy guards,
+  snapshot and restore. A colour reaches a dark device (and one that ignores it stays dark),
+  so this is the channel of the invisible measurement.
+* `pascl.shell.ha_light`, any light the host exposes as an entity (Matter, a Hue bridge, ZHA,
+  Lutron's colour devices if any: the transport underneath does not matter): `light.turn_on`
+  with no transition, `homeassistant.update_entity` to read back, the entity's state changes
+  relayed by the link. `light.turn_on` turns a dark fixture on, so this channel is measured in
+  the forced mode only. A dimmer-only load (a Lutron Caseta dimmer, say) has no xy capability
+  and never reaches the roster; a colour-capable Lutron device (the Ketra line) comes through
+  this channel, or a native LEAP channel later, in the forced mode for the same reason.
+
+The runtime chooses the channel by the fixture's transport (`channel_for`), and the airtime
+key it shares: the coordinator's base topic for Zigbee2MQTT, the transport id otherwise.
+
+`pascl.shell.gamut_measure` drives a `Probe` over a channel with the timing rules, against the
+injected clock, and restores the fixture whatever happens. Links: `pascl.shell.ha_mqtt`
+through Home Assistant (REST `mqtt.publish`, the `mqtt/subscribe` WebSocket, entity watches
+and service calls on the same socket, `pip install pascl[ha]`) and `pascl.shell.paho_mqtt`
+straight to a broker (`pip install pascl[mqtt]`).
+
+**Many at once.** One link is one socket, and a channel drains it, so `pascl.shell.hub` fans
+one link out: every channel gets a view with its own queue, one reader thread routes each
+message to the views subscribed to its topic, and `measure_many` runs one thread per fixture.
+
+**How many at once is measured, not assumed** (`pascl.shell.airtime`). A coordinator's
+airtime budget depends on the radio, the mesh, the firmware and whatever else is on the air,
+and the evidence is in every sample: a device that answers its first read-back within the
+latency budget is on a transport with room to spare; one that needs a second read, or none,
+is on one that is queuing. So the number in flight per key (a coordinator's base topic, a
+transport id) is a window driven the way TCP drives its own: additive increase after a streak
+of first-read answers under the budget, multiplicative decrease on the first retry or timeout,
+from one up to a ceiling (`--parallel N`). A decrease never interrupts a measurement already
+running; it stops the next launch until the window has room. `measure_adaptively` reports
+what each window did. On the reference installation the window on the living-room
+chandelier's coordinator climbed from one to six within the first minute and measured all
+fifteen bulbs in 68 s with 355 of 360 samples prompt, three times the budget the earlier
+estimate had allowed. A fixture on a busy coordinator is still best measured with its render
+held: the forced pass over 43 lit fixtures took 2 m 35 s with the rooms' renders paused.
 
     HA_TOKEN=... pascl gamut measure --model home.yaml --binding binding.yaml \
-        --fixture den_strip --ha-url http://homeassistant:8123 --write home.yaml
+        --fixture den_strip --fixture den_pendant_1 [--parallel 6] [--force] \
+        --ha-url http://homeassistant:8123 --write home.yaml
 
-resolves the fixture's command topic from the binding, looks its device up, measures it
-(refusing a lit fixture unless `--allow-lit`), prints the verdict with every rule's fit, says
-whether a seed it held is confirmed, and records the polygon in the model. Measured this way on
-the reference installation's storeroom strip (off, 72 s, 24 of 24 answers): the same triangle
-its provisioning tool had recorded, to 2e-05. That tool is now a wrapper over these modules.
+reaches each fixture the way its transport allows, measures them in rounds, prints each
+verdict with every rule's fit, says whether a seed it held is confirmed, and records the
+polygons in the model (refusing any the model would not validate with). Measured this way on
+the reference installation's storeroom strip (off, 24 of 24 answers): the same triangle its
+provisioning tool had recorded, to 2e-05. That tool is now a wrapper over these modules.
 
 ## 8. What the palettes can show (`pascl palette check`)
 

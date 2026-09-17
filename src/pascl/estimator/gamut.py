@@ -534,17 +534,22 @@ def pick_target(
     device_ids: Mapping[str, str] | None,
     lit: Collection[str],
     occupied_rooms: Collection[str],
+    exclude: Collection[str] = (),
 ) -> FixtureStatus | None:
     """The fixture to measure now, or None: unmeasured before rebound before inherited (a
     seed is already exact, its confirmation can wait), then by room and name, skipping any
-    fixture that is lit or whose room is occupied. Measuring a dark fixture in an empty room
-    is invisible and self-restoring, which is what lets the runtime do this on its own, the
-    way the reference installation's daylight calibrator takes its empty-and-dark windows."""
+    fixture that is lit, whose room is occupied, or that the caller has set aside (one its
+    transport cannot measure invisibly). Measuring a dark fixture in an empty room is
+    invisible and self-restoring, which is what lets the runtime do this on its own, the way
+    the reference installation's daylight calibrator takes its empty-and-dark windows."""
     order = {"unmeasured": 0, "rebound": 1, "inherited": 2}
     candidates = [
         s
         for s in statuses(model, device_ids)
-        if s.status != "measured" and s.fixture not in lit and s.room not in occupied_rooms
+        if s.status != "measured"
+        and s.fixture not in lit
+        and s.fixture not in exclude
+        and s.room not in occupied_rooms
     ]
     if not candidates:
         return None

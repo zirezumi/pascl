@@ -132,6 +132,9 @@ def simulated(monkeypatch: pytest.MonkeyPatch) -> SimulatedHome:
     monkeypatch.setattr(ha_mqtt, "HAMqttLink", lambda url, token: home)
     monkeypatch.setattr(gamut_measure, "SystemClock", FastClock)
     monkeypatch.setattr(gamut_runtime, "SystemClock", FastClock)
+    # the hub's queues wait in real time; keep each wait short so the suite stays quick
+    monkeypatch.setattr(gamut_measure, "POLL", 0.01)
+    monkeypatch.setattr(gamut_measure, "MIN_WAIT", 0.005)
     monkeypatch.setenv("HA_URL", "http://ha.test:8123")
     monkeypatch.setenv("HA_TOKEN", "t")
     return home

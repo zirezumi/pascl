@@ -122,7 +122,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     me.add_argument("--model", required=True, type=Path)
     me.add_argument("--binding", required=True, type=Path, help="names the fixture's /set topic")
-    me.add_argument("--fixture", required=True)
+    me.add_argument(
+        "--fixture", action="append", required=True, help="a fixture to measure (repeatable)"
+    )
+    me.add_argument(
+        "--parallel",
+        type=int,
+        default=2,
+        metavar="N",
+        help="the most fixtures in flight per coordinator or transport; the number actually in "
+        "flight is found from the samples (grown on prompt answers, halved on a retry)",
+    )
     me.add_argument("--ha-url", help="Home Assistant base URL (default: env HA_URL)")
     me.add_argument(
         "--identity",
@@ -131,8 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     me.add_argument(
         "--allow-lit",
+        "--force",
+        dest="allow_lit",
         action="store_true",
-        help="measure even if the fixture is on (pause whatever renders it first)",
+        help="forced mode: measure whatever the fixture's state and whoever is in the room, "
+        "visibly (otherwise a lit fixture is skipped and a measurement aborts, restoring the "
+        "fixture at once, when the room fills or the fixture is turned on)",
     )
     me.add_argument(
         "--write", type=Path, help="write the model with the measurement recorded to this path"
@@ -148,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--write", type=Path, help="where to write the model after each measurement")
     au.add_argument("--interval", type=float, default=300.0, help="seconds between ticks")
     au.add_argument("--once", action="store_true", help="one tick, then exit")
+    au.add_argument(
+        "--force",
+        action="store_true",
+        help="forced mode: lit fixtures and occupied rooms too, visibly",
+    )
 
     pa = sub.add_parser("palette", help="palette checks against the measured gamuts")
     ps = pa.add_subparsers(dest="palette_command")
@@ -404,80 +423,126 @@ def _cmd_gamut_ids(args: argparse.Namespace, model: Any) -> int:
 
 
 def _cmd_gamut_measure(args: argparse.Namespace, model: Any) -> int:
-    """Measure one fixture: resolve its /set topic from the binding, look its device up in
-    the coordinator's list, run the protocol over a Home Assistant MQTT link, print the
-    verdict, and optionally record it in the model (refusing a record the model would not
-    validate with)."""
+    """Measure one or more fixtures: each reached the way its transport allows (a Zigbee2MQTT
+    command topic, or the light entity the host exposes), measured together in batches sized
+    per coordinator or transport, the verdicts printed with every rule's fit, and the model
+    written with the records (refusing any the model would not validate with)."""
     from pascl.estimator.gamut import confirm_seed
     from pascl.harness.binding import expand, load_binding
     from pascl.model import dumps, validate, with_fixture_gamut
-    from pascl.shell.gamut_measure import gamut_from, measure
-    from pascl.shell.gamut_runtime import command_topics, device_infos, group_topics
-    from pascl.shell.z2m import Z2MDeviceChannel, group_set_topics
+    from pascl.shell.airtime import measure_adaptively
+    from pascl.shell.gamut_measure import gamut_from
+    from pascl.shell.gamut_runtime import channel_for, device_infos
+    from pascl.shell.hub import Hub
 
     binding = load_binding(args.binding.read_text(encoding="utf-8"))
     index = expand(binding, model)
-    topic = command_topics(model, index).get(args.fixture)
-    if topic is None:
-        print(f"the binding names no command topic for {args.fixture}", file=sys.stderr)
-        return 2
     link = _ha_link(args)
     if link is None:
         return 2
+    updated = model
+    failed = 0
     try:
-        # the groups to watch: the model's, plus whatever the coordinator says the device is in
-        watch = set(group_topics(model, index, args.fixture))
-        base = _transport_base(model, args.fixture)
-        info = device_infos(model, link).get(args.fixture)
-        if info is not None and base:
-            watch.update(group_set_topics(link, base, info.ieee_address))
-        identity = args.identity
-        if info is None and identity is None:
-            print(f"{args.fixture}: not in the coordinator's device list; binding to the topic")
-            identity = topic
-        channel = Z2MDeviceChannel(link, topic, identity=identity, watch=sorted(watch))
-        if info is not None:
-            channel.adopt(info)
-        before = channel.snapshot()
-        print(
-            f"{args.fixture} via {topic}: device {channel.identity} firmware {channel.firmware} "
-            f"before {before}",
-            file=sys.stderr,
-        )
-        verdict = measure(channel, allow_lit=args.allow_lit)
+        infos = device_infos(model, link)
+        hub = Hub(link)
+        keyed: list[tuple[str, str]] = []
+        found: dict[str, Any] = {}
+        for fixture in dict.fromkeys(args.fixture):
+            got = channel_for(model, index, hub.view(), fixture, infos)
+            if got is None:
+                print(
+                    f"{fixture}: neither a command topic nor a light entity reaches it",
+                    file=sys.stderr,
+                )
+                failed += 1
+                continue
+            channel, key = got
+            if args.identity and len(args.fixture) == 1:
+                channel = _rebind(channel, args.identity)
+            found[fixture] = channel
+            keyed.append((fixture, key))
+        channels = {f: found[f] for f, _key in keyed}
+        hub.start()  # the snapshots read through the hub too
+        try:
+            for f, ch in channels.items():
+                before = ch.snapshot()
+                print(
+                    f"{f}: device {ch.identity} firmware {ch.firmware} before {before}",
+                    file=sys.stderr,
+                )
+            results, windows = measure_adaptively(
+                channels,
+                dict(keyed),
+                allow_lit=args.allow_lit,
+                ceiling=max(1, args.parallel),
+                on_launch=lambda n, f, w: print(
+                    f"launch {n} ({f} of {w} on its transport)", file=sys.stderr
+                ),
+            )
+        finally:
+            hub.stop()
+        for key, w in sorted(windows.items()):
+            print(
+                f"airtime {key or '-'}: window ended at {w.final}, peak {w.peak}, "
+                f"{w.good} of {w.samples} samples prompt, {w.increases} up / {w.decreases} down",
+                file=sys.stderr,
+            )
+        for f, _key in keyed:
+            verdict = results[f]
+            if isinstance(verdict, BaseException):
+                print(f"{f}: FAILED {type(verdict).__name__}: {verdict}", file=sys.stderr)
+                failed += 1
+                continue
+            if verdict is None:
+                print(
+                    f"{f} is lit or its transport needs the forced mode; pass --force",
+                    file=sys.stderr,
+                )
+                failed += 1
+                continue
+            for note in verdict.notes:
+                print(f"{f} note: {note}", file=sys.stderr)
+            fits = " ".join(
+                f"{r.rule}={r.error:.5f}" + (f"(-{r.outliers})" if r.outliers else "")
+                for r in verdict.fits
+            )
+            print(
+                f"{f}: polygon {verdict.polygon} clip_rule {verdict.clip_rule} model_error "
+                f"{verdict.model_error} fits [{fits}] device_reports {verdict.device_reports} "
+                f"unanswered {verdict.unanswered}"
+            )
+            gamut = gamut_from(verdict, channels[f])
+            if gamut is None:
+                failed += 1
+                continue
+            held = _held_gamut(updated, f)
+            if held is not None and held.inherited_from is not None:
+                agreed, gap = confirm_seed(held, gamut.vertices)
+                word = "confirmed" if agreed else "CONTRADICTED"
+                print(
+                    f"{f}: seed from {held.inherited_from} {word} (gap {gap:.5f})",
+                    file=sys.stderr,
+                )
+            candidate = with_fixture_gamut(updated, f, gamut)
+            problems = validate(candidate)
+            if problems:
+                for p in problems:
+                    print(f"{f}: refused: {p}", file=sys.stderr)
+                failed += 1
+                continue
+            updated = candidate
     finally:
         link.close()
-    if verdict is None:
-        print(f"{args.fixture} is lit; pass --allow-lit after pausing its render", file=sys.stderr)
-        return 1
-    for note in verdict.notes:
-        print(f"note: {note}", file=sys.stderr)
-    fits = " ".join(
-        f"{f.rule}={f.error:.5f}" + (f"(-{f.outliers})" if f.outliers else "") for f in verdict.fits
-    )
-    print(
-        f"polygon {verdict.polygon} clip_rule {verdict.clip_rule} model_error "
-        f"{verdict.model_error} fits [{fits}] device_reports {verdict.device_reports} "
-        f"unanswered {verdict.unanswered}"
-    )
-    gamut = gamut_from(verdict, channel)
-    if gamut is None:
-        return 1
-    held = _held_gamut(model, args.fixture)
-    if held is not None and held.inherited_from is not None:
-        agreed, gap = confirm_seed(held, gamut.vertices)
-        word = "confirmed" if agreed else "CONTRADICTED"
-        print(f"seed from {held.inherited_from} {word} (gap {gap:.5f})", file=sys.stderr)
-    if args.write is not None:
-        updated = with_fixture_gamut(model, args.fixture, gamut)
-        problems = validate(updated)
-        if problems:
-            for p in problems:
-                print(f"refused: {p}", file=sys.stderr)
-            return 1
+    if args.write is not None and updated is not model:
         args.write.write_text(dumps(updated), encoding="utf-8")
         print(f"recorded in {args.write}", file=sys.stderr)
-    return 0
+    return 1 if failed else 0
+
+
+def _rebind(channel: Any, identity: str) -> Any:
+    """An explicit --identity overrides what discovery bound."""
+    channel._identity = identity
+    return channel
 
 
 def _cmd_gamut_auto(args: argparse.Namespace, model: Any) -> int:
@@ -518,10 +583,18 @@ def _cmd_gamut_auto(args: argparse.Namespace, model: Any) -> int:
             interval_s=args.interval,
             report=report,
             once=args.once,
+            force=args.force,
         )
     finally:
         link.close()
     return 0
+
+
+def _room_of(model: Any, fixture_id: str) -> str:
+    for rid, room in model.rooms.items():
+        if fixture_id in room.fixtures:
+            return str(rid)
+    return ""
 
 
 def _transport_base(model: Any, fixture_id: str) -> str | None:

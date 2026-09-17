@@ -11,6 +11,7 @@ from pascl.clock import ManualClock
 from pascl.core.gamut import XY, Polygon, project
 from pascl.shell.gamut_measure import (
     ANSWER_TIMEOUT,
+    MAX_READS,
     READ_AFTER,
     Observation,
     gamut_from,
@@ -38,6 +39,7 @@ class FakeDevice:
 
     identity = "fake-device-1"
     firmware = "1.116.3"
+    needs_lit = False
 
     def __init__(
         self,
@@ -90,8 +92,9 @@ class FakeDevice:
         self.pending = [(t, ob) for t, ob in self.pending if t > now]
         return due
 
-    def restore(self) -> None:
+    def restore(self, transition: float = 0.2) -> None:
         self.restored = True
+        self.restore_transition = transition
 
 
 def _clock() -> ManualClock:
@@ -115,12 +118,25 @@ def test_measure_recovers_the_polygon_by_reading_back() -> None:
     assert g.model_error == v.model_error
 
 
-def test_measure_uses_a_spontaneous_report_without_reading() -> None:
+def test_the_read_back_ends_the_sample_and_a_spontaneous_report_is_a_fallback() -> None:
     clock = _clock()
     dev = FakeDevice(clock, TRIANGLE, reports=True)
+    t0 = clock.monotonic()
     v = measure(dev, clock=clock)
     assert v is not None and v.polygon is not None and len(v.polygon) == 3
-    assert dev.reads == 0
+    # every sample read back (the report came at the same instant and did not replace it),
+    # and a fixture takes well under a minute: the exposed window per sample is the read delay
+    assert dev.reads == dev.commands
+    assert clock.monotonic() - t0 < 24 * (READ_AFTER + 0.5)
+
+    class ReadsUnanswered(FakeDevice):
+        def read(self) -> None:
+            self.reads += 1
+
+    dev2 = ReadsUnanswered(clock, TRIANGLE, reports=True)
+    v2 = measure(dev2, clock=clock)
+    assert v2 is not None and v2.polygon is not None and len(v2.polygon) == 3
+    assert dev2.reads == 3 * dev2.commands  # every read retried, the report carried the sample
 
 
 def test_probe_inside_the_true_gamut_is_answered_by_the_read_back() -> None:
@@ -142,12 +158,23 @@ def test_fixture_turning_on_aborts_and_withholds_the_polygon() -> None:
     v = measure(dev, clock=clock)
     assert v is not None and v.polygon is None and v.aborted is not None
     assert "turned on" in v.aborted and any("aborted" in n for n in v.notes)
-    assert dev.commands == 5 and dev.restored
+    assert dev.commands == 5 and dev.restored and dev.restore_transition == 0.0
     assert gamut_from(v, dev, clock) is None
-    # a fixture measured lit on purpose is not aborted by its own ON state
+    # a fixture measured lit on purpose is not aborted by its own ON state, and a sample is
+    # not cut short by it either: the read-back still answers every probe
     dev2 = FakeDevice(clock, TRIANGLE, lit=True, lit_at=5)
     v2 = measure(dev2, allow_lit=True, clock=clock)
     assert v2 is not None and v2.polygon is not None and v2.aborted is None
+    assert v2.unanswered == 0 and dev2.reads == dev2.commands
+
+    class AlwaysLit(FakeDevice):
+        def command(self, xy: XY) -> None:
+            super().command(xy)
+            self.pending.append((self.clock.monotonic() + 0.01, Observation("lit")))
+
+    dev3 = AlwaysLit(clock, TRIANGLE, lit=True)
+    v3 = measure(dev3, allow_lit=True, clock=clock)
+    assert v3 is not None and v3.polygon is not None and v3.unanswered == 0
 
 
 def test_abort_when_stops_between_samples() -> None:
@@ -193,7 +220,7 @@ def test_take_sample_times_out_on_a_silent_device() -> None:
     t0 = clock.monotonic()
     s = take_sample(dev, (0.95, 0.04), clock)
     assert s.xy is None and s.echo_only and not s.foreign
-    assert dev.reads == 1
+    assert dev.reads == MAX_READS
     assert READ_AFTER <= clock.monotonic() - t0 <= ANSWER_TIMEOUT + 0.3
 
 
@@ -273,6 +300,42 @@ def test_resting_colour_reported_late_is_not_an_answer() -> None:
     link.deliver("z2m-3/bulb", {"color": {"x": 0.6915, "y": 0.3083}, "state": "OFF"})
     obs = ch.observe(0.1)
     assert [(o.kind, o.trusted) for o in obs] == [("device", True)]
+
+
+def test_a_read_that_lands_before_the_command_applied_is_read_again() -> None:
+    """The read-back answers with the colour the device showed before the command: it has
+    not applied it yet. The channel passes nothing on, the driver reads again, and the second
+    read's answer is the trusted one."""
+    link = FakeLink()
+    ch = Z2MDeviceChannel(link, "z2m-3/bulb/set")
+    link.deliver("z2m-3/bulb", {"state": "OFF", "color": {"x": 0.4726, "y": 0.413}})
+    assert ch.is_lit() is False
+    ch.command((0.95, 0.04))
+    link.deliver("z2m-3/bulb", {"color": {"x": 0.95, "y": 0.04}, "state": "OFF"})  # echo
+    assert [o.kind for o in ch.observe(0.1)] == ["echo"]
+    ch.read()
+    link.deliver("z2m-3/bulb", {"color": {"x": 0.4726, "y": 0.413}, "state": "OFF"})  # too early
+    assert ch.observe(0.1) == []
+    ch.read()
+    link.deliver("z2m-3/bulb", {"color": {"x": 0.6915, "y": 0.3083}, "state": "OFF"})
+    assert [(o.kind, o.trusted) for o in ch.observe(0.1)] == [("device", True)]
+    # the driver, end to end: the first read is too early, the second answers
+    clock = _clock()
+    early = [0]
+
+    class SlowToApply(FakeDevice):
+        def read(self) -> None:
+            self.reads += 1
+            if self.reads == 1:
+                early[0] += 1
+                return  # nothing comes back the first time (the channel dropped it)
+            self.pending.append(
+                (self.clock.monotonic() + 0.05, Observation("device", self.current, trusted=True))
+            )
+
+    dev = SlowToApply(clock, TRIANGLE)
+    s = take_sample(dev, (0.95, 0.04), clock)
+    assert s.trusted and s.xy is not None and dev.reads == 2
 
 
 def test_state_on_is_reported_as_lit() -> None:
@@ -385,7 +448,10 @@ def test_group_topics_from_the_coordinators_group_list() -> None:
     assert "z2m-1/office/set" in link.subscribed
     ch.command((0.95, 0.04))
     link.deliver("z2m-1/office/set", '{"state": "ON", "brightness": 200}')
-    assert [o.kind for o in ch.observe(0.1)] == ["foreign"]
+    assert [o.kind for o in ch.observe(0.1)] == [
+        "foreign",
+        "lit",
+    ]  # a group ON: foreign, and the fixture is being lit
 
 
 def test_multi_endpoint_read_lands_under_the_unsuffixed_key() -> None:

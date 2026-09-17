@@ -20,7 +20,9 @@ from pascl.estimator.gamut import Probe
 SOURCE = os.environ.get("PASCL_PRIVATE_GAMUT")
 DATA = json.loads(Path(SOURCE).read_text(encoding="utf-8")) if SOURCE else {}
 FIXTURES = sorted(
-    f for f, e in DATA.get("fixtures", {}).items() if e.get("hull") and not e.get("verbatim")
+    f
+    for f, e in DATA.get("fixtures", {}).items()
+    if len(e.get("hull") or []) >= 3 and not e.get("verbatim")
 )
 
 pytestmark = pytest.mark.skipif(

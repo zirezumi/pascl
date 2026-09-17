@@ -21,12 +21,14 @@ from pascl.clock import ManualClock
 from pascl.core.gamut import XY, Polygon, project
 from pascl.harness.binding import expand, load_binding
 from pascl.model import HomeModel, load
+from pascl.shell.gamut_measure import measure
 from pascl.shell.gamut_runtime import (
     command_topics,
     device_ids,
     device_infos,
     group_topics,
     host_view,
+    presence_entities,
     run,
     tick,
 )
@@ -44,7 +46,7 @@ class SimulatedHome:
 
     def __init__(self, polygons: dict[str, Polygon], states: dict[str, str]) -> None:
         self.polygons = polygons
-        self.states = states
+        self.states = dict(states)
         self.inbox: list[tuple[str, str]] = []
         self.published: list[tuple[str, str]] = []
         self.subscribed: list[str] = []
@@ -91,12 +93,22 @@ class SimulatedHome:
         out, self.inbox = self.inbox, []
         yield from out
 
-    # -- REST --------------------------------------------------------------------------
+    # -- REST and entity watching ----------------------------------------------------------
     def get_states(self) -> dict[str, str]:
         self.state_reads += 1
         if self.occupy_after is not None and self.state_reads > self.occupy_after:
             return {**self.states, "binary_sensor.den_presence": "on"}
         return dict(self.states)
+
+    def watch_entity(self, entity_id: str) -> str:
+        topic = f"ha/state/{entity_id}"
+        self.subscribed.append(topic)
+        return topic
+
+    def presence(self, entity_id: str, state: str) -> None:
+        """A watched presence entity changes state (relayed like the real link does)."""
+        self.states[entity_id] = state
+        self.inbox.append((f"ha/state/{entity_id}", state))
 
     def close(self) -> None:
         pass
@@ -128,8 +140,8 @@ class TimedChannel(Z2MDeviceChannel):
 
 
 def _factory(clock: ManualClock) -> object:
-    def make(link: object, topic: str, watch: list[str]) -> TimedChannel:
-        ch = TimedChannel(link, topic, watch=watch)  # type: ignore[arg-type]
+    def make(link: object, topic: str, watch: list[str], occupancy: list[str]) -> TimedChannel:
+        ch = TimedChannel(link, topic, watch=watch, occupancy=occupancy)  # type: ignore[arg-type]
         ch.clock = clock
         return ch
 
@@ -175,12 +187,50 @@ def test_group_command_during_a_sample_is_foreign() -> None:
     clock = _clock()
     home = SimulatedHome({"den_pendant_1": TRIANGLE}, DARK_EMPTY)
     make = _factory(clock)
-    channel = make(home, "z2m-1/den_pendant_1/set", group_topics(model, index, "den_pendant_1"))  # type: ignore[operator]
+    channel = make(home, "z2m-1/den_pendant_1/set", group_topics(model, index, "den_pendant_1"), [])  # type: ignore[operator]
     assert "z2m-1/den/set" in home.subscribed
     channel.command((0.95, 0.04))
     home.inbox.append(("z2m-1/den/set", '{"brightness": 120}'))
     kinds = [o.kind for o in channel.observe(0.1)]
     assert kinds == ["echo", "foreign"]
+    # a group command that turns the light on is the fixture being lit, before any report
+    channel.command((0.04, 0.94))
+    home.inbox.append(("z2m-1/den/set", '{"state": "ON", "brightness": 120, "transition": 2}'))
+    kinds = [o.kind for o in channel.observe(0.1)]
+    assert kinds == ["echo", "foreign", "lit"]
+
+
+def test_presence_return_aborts_ahead_of_the_render() -> None:
+    """The room's presence entity flips on: the measurement aborts on that relayed event and
+    restores with no transition, before the render that follows presence reaches the wire."""
+    model = _model()
+    index = _index(model)
+    clock = _clock()
+    home = SimulatedHome({"den_pendant_1": TRIANGLE}, DARK_EMPTY)
+    assert presence_entities(model, index, "den") == [  # type: ignore[arg-type]
+        "binary_sensor.den_presence",
+        "binary_sensor.den_switch_presence",
+        "binary_sensor.house_presence",
+    ]
+    make = _factory(clock)
+    occupancy = [home.watch_entity(e) for e in presence_entities(model, index, "den")]  # type: ignore[arg-type]
+    channel = make(home, "z2m-1/den_pendant_1/set", [], occupancy)  # type: ignore[operator]
+    channel.snapshot()
+    commands_before = len(home.published)
+    home.presence("binary_sensor.den_presence", "on")
+    v = measure(channel, clock=clock)
+    assert v is not None and v.aborted is not None and "occupied" in v.aborted
+    # one probe went out, then the restore, with no transition
+    sets = [p for t, p in home.published[commands_before:] if t == "z2m-1/den_pendant_1/set"]
+    assert len(sets) == 2 and '"transition": 0.0' in sets[-1] and '"color"' in sets[-1]
+    # in the forced mode the same event is ignored
+    home2 = SimulatedHome({"den_pendant_1": TRIANGLE}, DARK_EMPTY)
+    occupancy = [home2.watch_entity(e) for e in presence_entities(model, index, "den")]  # type: ignore[arg-type]
+    channel2 = make(home2, "z2m-1/den_pendant_1/set", [], occupancy)  # type: ignore[operator]
+    channel2.snapshot()
+    home2.presence("binary_sensor.den_presence", "on")
+    v2 = measure(channel2, allow_lit=True, clock=clock)
+    assert v2 is not None and v2.polygon is not None and v2.aborted is None
 
 
 def test_tick_measures_records_binds_and_seeds(tmp_path: Path) -> None:
