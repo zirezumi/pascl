@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from pascl.harness.assemble import assemble
-from pascl.harness.binding import expand, load_binding
+from pascl.harness.binding import expand, load_binding, unbound_live
 from pascl.harness.trace import Record, normalize_command, read_trace, write_trace
 from pascl.model import HomeModel, load
 
@@ -79,7 +79,31 @@ def test_binding_expands_over_the_model(model: HomeModel, binding) -> None:  # t
     assert idx.entities["den_plate/illuminance"].transform == "float"
     assert idx.topics["z2m-1/den_strip/set"].path == "fixtures.den_strip"
     assert idx.topics["z2m-1/den_bulbs/set"].path == "groups.den.den_bulbs"
-    assert "timer.main_space_vacancy" in idx.entities
+    assert idx.entities["timer.house_vacancy"].path == "spaces.house.vacancy_timer"
+    assert idx.entities["binary_sensor.house_presence"].path == "spaces.house.presence"
+    assert idx.entities["input_number.current_warm_strips_y_cct"].path == "scene.warm.strip_y"
+
+
+def test_binding_expands_only_what_each_room_declares(model: HomeModel, binding) -> None:  # type: ignore[no-untyped-def]
+    idx = expand(binding, model)
+    # the den is on its space's vacancy timer, so it owns no timer of its own
+    assert model.rooms["den"].vacancy.scope == "space"
+    assert "timer.den_vacancy" not in idx.entities
+    assert idx.entities["timer.pantry_vacancy"].path == "rooms.pantry.vacancy_timer"
+    # only the den declares a switch zone
+    assert model.rooms["pantry"].switch_zone is None
+    assert "binary_sensor.pantry_switch_presence" not in idx.entities
+    assert idx.entities["binary_sensor.den_switch_presence"].path == "rooms.den.switch_zone"
+
+
+def test_unbound_live_names_the_ids_a_host_lacks(model: HomeModel, binding) -> None:  # type: ignore[no-untyped-def]
+    idx = expand(binding, model)
+    live = set(idx.entities) - {"input_boolean.den_pendant_1_held_off", "timer.pantry_vacancy"}
+    assert unbound_live(idx, live) == [
+        "input_boolean.den_pendant_1_held_off",
+        "timer.pantry_vacancy",
+    ]
+    assert unbound_live(idx, idx.entities) == []
 
 
 def _raw(t: str, **fields: object) -> str:

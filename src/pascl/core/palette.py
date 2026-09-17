@@ -19,7 +19,7 @@ from math import cos, pi
 from typing import Final
 
 from pascl.core.color import NEAR_WHITE, XY, blend_xy
-from pascl.model.schema import Calibration, Palette
+from pascl.model.schema import Calibration, HomeModel, Palette
 
 CCT_WARM_K: Final = 2000.0
 CCT_COOL_K: Final = 3100.0
@@ -89,6 +89,15 @@ def kelvin_xy(kelvin: float, calibration: Calibration) -> XY:
     return blend_xy(calibration.warm_xy, calibration.night_xy, f)
 
 
+def default_warm_offset(model: HomeModel) -> float:
+    """The warm offset a home declares (its ``solar_cct_offset`` palette's ``offset_k``), the
+    value the runtime starts from before a user moves it; 0 when no such palette exists."""
+    for pal in model.scenes.palettes.values():
+        if pal.kind == "solar_cct_offset" and pal.offset_k is not None:
+            return float(pal.offset_k)
+    return 0.0
+
+
 def static_index(offset: int, base: int, stride: int, length: int) -> int:
     """Which entry of a static palette a fixture shows now; -1 when the palette is empty."""
     if length <= 0:
@@ -104,8 +113,13 @@ def scene_goal(
     offset: int,
     base: int,
     stride: int,
+    warm_offset_k: float | None = None,
 ) -> XY:
     """The colour a scene asks of one fixture right now.
+
+    The warm offset is one runtime value shared by the warm palette and the warm white anchor
+    the colour-temperature decision compares against; the palette's ``offset_k`` is its
+    declared default, used when the caller has no live value.
 
     ``solar_keyframes`` (the day-of-week keyframe palette) is not yet modelled and renders as
     natural white; recorded as a v0 gap rather than approximated.
@@ -115,5 +129,6 @@ def scene_goal(
         idx = static_index(offset, base, stride, len(entries))
         return entries[idx] if idx >= 0 else NEAR_WHITE
     if palette.kind == "solar_cct_offset":
-        return kelvin_xy(warm_kelvin(white, float(palette.offset_k or 0)), calibration)
+        offset_k = float(palette.offset_k or 0) if warm_offset_k is None else warm_offset_k
+        return kelvin_xy(warm_kelvin(white, offset_k), calibration)
     return natural_xy(white, calibration)

@@ -11,12 +11,16 @@ Paths name things the way the Home Model does, never the way any host does:
 
 * ``solar.progress``, ``solar.factor``, ``solar.ready``, ``solar.pct.<anchor>``
 * ``sleep``, ``scene.offset``, ``scene.palette.<palette>``, ``scene.transition_s``,
-  ``scene.linger_s``
+  ``scene.linger_s``, ``scene.warm_offset_k``
+* ``scene.natural.kelvin`` / ``.bulb_x`` / ``.bulb_y`` / ``.strip_x`` / ``.strip_y`` and
+  ``scene.warm.kelvin`` / ``.bulb_x`` / ``.bulb_y`` / ``.strip_x`` / ``.strip_y`` (the white
+  anchors the reference rendered and its rooms read)
 * ``ambient.accumulator``, ``ambient.weather``, ``ambient.scope.<scope>.drive``,
   ``ambient.scope.<scope>.coupling``
-* ``vacancy.main_space``
-* ``rooms.<room>.presence`` / ``.switch_zone`` / ``.multiplier`` / ``.vacancy_timer`` /
-  ``.hold_active`` / ``.on_override`` / ``.hold_ms``
+* ``spaces.<space>.presence`` / ``.vacancy_timer`` / ``.dial_active`` (a composite of rooms)
+* ``rooms.<room>.presence`` / ``.switch_zone`` (rooms that declare one) / ``.multiplier`` /
+  ``.vacancy_timer`` (room-scoped vacancy only) / ``.hold_active`` / ``.on_override`` /
+  ``.hold_ms``
 * ``scene_groups.<group>`` (the palette bound to a render group)
 * ``fixtures.<fixture>.factor`` / ``.color_factor`` / ``.override_x`` / ``.override_y`` /
   ``.override_kelvin`` / ``.override_is_ct`` / ``.held_off`` / ``.scene_x`` / ``.scene_y`` /

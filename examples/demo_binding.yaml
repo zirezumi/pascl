@@ -33,6 +33,10 @@ binding:
     hold_active: "input_boolean.{room}_switch_hold_active"
     on_override: "input_boolean.{room}_on_override"
     hold_ms: "input_number.{room}_presence_hold_ms"
+  space:
+    presence: "binary_sensor.{space}_presence"
+    vacancy_timer: "timer.{space}_vacancy"
+    dial_active: "input_boolean.{space}_tap_dial_rotation_active"
   scene_group:
     selector: "input_select.{scene_group}_scene_selector"
   ambient_scope:
@@ -50,7 +54,18 @@ binding:
     scene_linger_s: "input_number.light_scene_linger_time"
     ambient_accumulator: "input_number.pascl_ambient_normalization_accumulator"
     ambient_weather: "input_boolean.pascl_ambient_weather_enable"
-    main_space_vacancy_timer: "timer.main_space_vacancy"
+    # the white anchors the reference renders and every room reads (the value read, not the
+    # recipe, so a replay can be judged against what the reference actually used)
+    natural_kelvin: "input_number.current_cct_kelvin"
+    natural_bulb_x: "input_number.current_bulbs_x_cct"
+    natural_bulb_y: "input_number.current_bulbs_y_cct"
+    natural_strip_x: "input_number.current_strips_x_cct"
+    natural_strip_y: "input_number.current_strips_y_cct"
+    warm_kelvin: "input_number.current_warm_cct_kelvin"
+    warm_bulb_x: "input_number.current_warm_bulbs_x_cct"
+    warm_bulb_y: "input_number.current_warm_bulbs_y_cct"
+    warm_strip_x: "input_number.current_warm_strips_x_cct"
+    warm_strip_y: "input_number.current_warm_strips_y_cct"
   palette_names:
     Natural White: natural_white
     Natural Color: natural_color

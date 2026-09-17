@@ -18,17 +18,33 @@ Three properties are enforced here rather than hoped for:
 
 What is not here is state: multipliers, factors, colour overrides, intent caches, holds, the
 learned parameters. Those are runtime or learned state and live elsewhere by design.
+
+Rooms may be grouped into **spaces**: a composite of rooms that behaves as one place for
+vacancy (one shared timer that any member's presence cancels, whose expiry sweeps every
+member), for the whole-space gestures (all on, all off, the house-wide dial) and for the wake
+after sleep. A room in a space renders on its own presence for the occupied tier and on the
+space's for staying lit: it keeps its lights on at the vacant tier while any other member is
+occupied. A home with no such composite declares no spaces and every room stands alone; the
+reference installation's open-plan "main space" is one instance, not a built-in concept.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast, get_args
 
 import yaml
 
-SCHEMA_VERSION = 0
+from pascl.model.geometry import (
+    CLIP_RULES,
+    SAME_MODEL_FAIL,
+    ClipRule,
+    polygon_problems,
+    vertex_deviation,
+)
+
+SCHEMA_VERSION = 1
 
 CURVE_ANCHORS: tuple[str, ...] = (
     "midnight",
@@ -61,8 +77,8 @@ Modality = Literal[
 Role = Literal["accent", "highlight"]
 GroupTier = Literal["room", "type", "named", "phantom"]
 Fusion = Literal["or", "or_pir_latched"]
-VacancyScope = Literal["room", "main_space"]
-RoomClass = Literal["main", "non_main"]
+VacancyScope = Literal["room", "space"]
+WakeRelight = Literal["all_dark", "occupied_dark"]
 RoomPattern = Literal["A", "C"]
 SleepBehaviour = Literal["suppress", "dim", "none"]
 SurfaceKind = Literal["inovelli_vzm32", "hue_tap_dial", "lutron_pico", "generic"]
@@ -138,6 +154,38 @@ class Sensor:
 
 
 @dataclass(frozen=True)
+class Gamut:
+    """A fixture's measured colour gamut: the convex polygon of chromaticities it can reach,
+    counter-clockwise in CIE xy, and the rule by which the device clips to it. Measured on
+    the physical device (``pascl.estimator.gamut``), never taken from a model table, and bound
+    to the transport's identity for that device so a replacement is measured afresh. The
+    comparators judge the device against the intent clipped onto this polygon; a fixture
+    without one resolves to the identity.
+
+    A polygon may also be *inherited*: copied from a measured fixture whose material carries
+    the same model label, so a new fixture is exact from its first minute. That is data with
+    provenance (``inherited_from`` names the source), not brand knowledge: the engine never
+    learns what the label means, only that the author called two fixtures the same hardware.
+    An inherited polygon is a seed the runtime confirms by measuring the fixture itself."""
+
+    vertices: tuple[XY, ...]
+    bound_to: str | None = None
+    """The transport's identity for the measured device (opaque to the core)."""
+    measured: str | None = None
+    """When it was measured, ISO 8601, opaque to the core."""
+    model_error: float | None = None
+    """Worst per-axis gap between the device's own answers and ``clip_rule`` applied to the
+    polygon, over the probes that test the rule; None when unverified."""
+    clip_rule: ClipRule = "closest"
+    """How the device clips an unreachable command; see :data:`CLIP_RULES`."""
+    inherited_from: str | None = None
+    """The measured fixture this polygon was copied from; None when measured on this one."""
+    firmware: str | None = None
+    """The device's firmware at measurement, as the transport reported it. Information for a
+    reader comparing units, never a staleness trigger: a gamut does not drift."""
+
+
+@dataclass(frozen=True)
 class Fixture:
     material: str
     curve: str
@@ -146,6 +194,7 @@ class Fixture:
     address: str | None = None
     scene_group: str | None = None
     palette_stride: int = 0
+    gamut: Gamut | None = None
 
 
 @dataclass(frozen=True)
@@ -166,8 +215,27 @@ class Presence:
 
 @dataclass(frozen=True)
 class Vacancy:
-    scope: VacancyScope
-    seconds: int
+    """How a room's lights go out after it empties: on its own timer (``room``, with its own
+    ``seconds``) or on its space's shared timer (``space``, whose duration the space declares)."""
+
+    scope: VacancyScope = "room"
+    seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class Space:
+    """A composite of rooms that empties, wakes and takes whole-place gestures as one.
+
+    Membership is declared by each room's ``space``; presence is the OR of the members' presence
+    composites plus ``extra_presence``. ``vacancy_s`` is the shared timer any member's presence
+    cancels and whose expiry sweeps every member that uses it. ``wake_relight`` says what a wake
+    from sleep relights: every dark member (the open-plan default) or only occupied dark ones,
+    which is also what a room outside any space does.
+    """
+
+    vacancy_s: int
+    extra_presence: tuple[str, ...] = ()
+    wake_relight: WakeRelight = "all_dark"
 
 
 @dataclass(frozen=True)
@@ -196,7 +264,6 @@ class ControlSurface:
 
 @dataclass(frozen=True)
 class Room:
-    cls: RoomClass
     vacancy: Vacancy
     presence: Presence
     fixtures: dict[str, Fixture]
@@ -205,6 +272,8 @@ class Room:
     scene_groups: dict[str, SceneGroup] = field(default_factory=dict)
     control_surfaces: dict[str, ControlSurface] = field(default_factory=dict)
     switch_zone: Presence | None = None
+    space: str | None = None
+    """The composite this room belongs to, if any; see :class:`Space`."""
     pattern: RoomPattern = "A"
     palette_base: int = 0
     ambient_scope: str | None = None
@@ -279,6 +348,7 @@ class HomeModel:
     scenes: Scenes
     solar: Solar = field(default_factory=Solar)
     calibrations: dict[str, Calibration] = field(default_factory=dict)
+    spaces: dict[str, Space] = field(default_factory=dict)
     zones: dict[str, Zone] = field(default_factory=dict)
     lux: Lux = field(default_factory=Lux)
     ambient_scopes: dict[str, AmbientScope] = field(default_factory=dict)
@@ -403,10 +473,29 @@ _TRANSPORT = ("kind", "attribution", "endpoint", "base_topic", "groupcast", "sta
 _CALIBRATION = ("warm_xy", "cool_xy", "night_xy")
 _MATERIAL = ("kind", "capabilities", "cct_range_k", "calibration", "model")
 _SENSOR = ("modality", "transport", "device", "zone", "address")
-_FIXTURE = ("material", "curve", "role", "transport", "address", "scene_group", "palette_stride")
+_FIXTURE = (
+    "material",
+    "curve",
+    "role",
+    "transport",
+    "address",
+    "scene_group",
+    "palette_stride",
+    "gamut",
+)
+_GAMUT = (
+    "vertices",
+    "bound_to",
+    "measured",
+    "model_error",
+    "clip_rule",
+    "inherited_from",
+    "firmware",
+)
 _GROUP = ("members", "tier", "transport", "address")
 _PRESENCE = ("sources", "fusion", "pir", "coalesce_ms")
 _VACANCY = ("scope", "seconds")
+_SPACE = ("vacancy_s", "extra_presence", "wake_relight")
 _CURVE = ("occupied", "vacant")
 _SCENE_GROUP = ("fixtures", "default", "parents")
 _SURFACE = (
@@ -419,7 +508,7 @@ _SURFACE = (
     "smart_bulb_binding",
 )
 _ROOM = (
-    "class",
+    "space",
     "vacancy",
     "presence",
     "fixtures",
@@ -449,6 +538,7 @@ _HOME = (
     "calibrations",
     "materials",
     "sensors",
+    "spaces",
     "rooms",
     "zones",
     "lux",
@@ -541,8 +631,26 @@ def _read_sensor(r: _Reader, ctx: str, v: object) -> Sensor:
     )
 
 
+def _read_gamut(r: _Reader, ctx: str, v: object) -> Gamut:
+    d = r.mapping(ctx, v, _GAMUT)
+    err = d.get("model_error")
+    model_error: float | None = None
+    if err is not None:
+        model_error = r.number(f"{ctx}.model_error", err)
+    return Gamut(
+        vertices=r.xys(f"{ctx}.vertices", r.req(ctx, d, "vertices")),
+        bound_to=r.string(f"{ctx}.bound_to", d.get("bound_to")),
+        measured=r.string(f"{ctx}.measured", d.get("measured")),
+        model_error=model_error,
+        clip_rule=r.literal(f"{ctx}.clip_rule", d.get("clip_rule"), CLIP_RULES, "closest"),
+        inherited_from=r.string(f"{ctx}.inherited_from", d.get("inherited_from")),
+        firmware=r.string(f"{ctx}.firmware", d.get("firmware")),
+    )
+
+
 def _read_fixture(r: _Reader, ctx: str, v: object) -> Fixture:
     d = r.mapping(ctx, v, _FIXTURE)
+    gamut = d.get("gamut")
     return Fixture(
         material=r.string(f"{ctx}.material", r.req(ctx, d, "material")) or "",
         curve=r.string(f"{ctx}.curve", r.req(ctx, d, "curve")) or "",
@@ -551,6 +659,7 @@ def _read_fixture(r: _Reader, ctx: str, v: object) -> Fixture:
         address=r.string(f"{ctx}.address", d.get("address")),
         scene_group=r.string(f"{ctx}.scene_group", d.get("scene_group")),
         palette_stride=r.integer(f"{ctx}.palette_stride", d.get("palette_stride"), 0),
+        gamut=None if gamut is None else _read_gamut(r, f"{ctx}.gamut", gamut),
     )
 
 
@@ -577,9 +686,21 @@ def _read_presence(r: _Reader, ctx: str, v: object) -> Presence:
 
 def _read_vacancy(r: _Reader, ctx: str, v: object) -> Vacancy:
     d = r.mapping(ctx, v, _VACANCY)
+    seconds = d.get("seconds")
     return Vacancy(
-        scope=r.literal(f"{ctx}.scope", r.req(ctx, d, "scope"), get_args(VacancyScope), "room"),
-        seconds=r.integer(f"{ctx}.seconds", r.req(ctx, d, "seconds"), 0),
+        scope=r.literal(f"{ctx}.scope", d.get("scope"), get_args(VacancyScope), "room"),
+        seconds=None if seconds is None else r.integer(f"{ctx}.seconds", seconds, 0),
+    )
+
+
+def _read_space(r: _Reader, ctx: str, v: object) -> Space:
+    d = r.mapping(ctx, v, _SPACE)
+    return Space(
+        vacancy_s=r.integer(f"{ctx}.vacancy_s", r.req(ctx, d, "vacancy_s"), 0),
+        extra_presence=r.strings(f"{ctx}.extra_presence", d.get("extra_presence")),
+        wake_relight=r.literal(
+            f"{ctx}.wake_relight", d.get("wake_relight"), get_args(WakeRelight), "all_dark"
+        ),
     )
 
 
@@ -632,9 +753,10 @@ def _read_surface(r: _Reader, ctx: str, v: object) -> ControlSurface:
 def _read_room(r: _Reader, ctx: str, v: object) -> Room:
     d = r.mapping(ctx, v, _ROOM)
     switch_zone = d.get("switch_zone")
+    vacancy = d.get("vacancy")
     return Room(
-        cls=r.literal(f"{ctx}.class", r.req(ctx, d, "class"), get_args(RoomClass), "non_main"),
-        vacancy=_read_vacancy(r, f"{ctx}.vacancy", r.req(ctx, d, "vacancy")),
+        space=r.string(f"{ctx}.space", d.get("space")),
+        vacancy=Vacancy() if vacancy is None else _read_vacancy(r, f"{ctx}.vacancy", vacancy),
         presence=_read_presence(r, f"{ctx}.presence", r.req(ctx, d, "presence")),
         fixtures=r.named(
             f"{ctx}.fixtures", r.req(ctx, d, "fixtures"), lambda c, s: _read_fixture(r, c, s)
@@ -765,6 +887,7 @@ def from_dict(data: object) -> HomeModel:
         sensors=r.named(
             f"{ctx}.sensors", r.req(ctx, d, "sensors"), lambda c, s: _read_sensor(r, c, s)
         ),
+        spaces=r.named(f"{ctx}.spaces", d.get("spaces"), lambda c, s: _read_space(r, c, s)),
         rooms=r.named(f"{ctx}.rooms", r.req(ctx, d, "rooms"), lambda c, s: _read_room(r, c, s)),
         zones=r.named(f"{ctx}.zones", d.get("zones"), lambda c, s: _read_zone(r, c, s)),
         lux=Lux() if lux is None else _read_lux(r, f"{ctx}.lux", lux),
@@ -842,6 +965,40 @@ def validate(m: HomeModel) -> list[str]:
                 fx.scene_group is None or fx.scene_group in room.scene_groups,
                 f"{fctx}: scene_group '{fx.scene_group}' is not in this room",
             )
+            if fx.gamut is not None:
+                fx_mat = m.materials.get(fx.material)
+                check(
+                    fx_mat is None or "xy" in fx_mat.capabilities,
+                    f"{fctx}: a gamut on a material without the xy capability",
+                )
+                for problem in polygon_problems(fx.gamut.vertices):
+                    check(False, f"{fctx}.gamut: {problem}")
+                check(
+                    fx.gamut.model_error is None or fx.gamut.model_error >= 0,
+                    f"{fctx}.gamut: model_error must be non-negative",
+                )
+                check(
+                    fx.gamut.clip_rule != "rgb_clamp" or len(fx.gamut.vertices) == 3,
+                    f"{fctx}.gamut: rgb_clamp is a rule for a three-primary (triangle) gamut",
+                )
+                seed_id = fx.gamut.inherited_from
+                if seed_id is not None:
+                    seed_fx = _find_fixture(m, seed_id)
+                    seed_mat = None if seed_fx is None else m.materials.get(seed_fx.material)
+                    check(seed_id != fid, f"{fctx}.gamut: inherited from itself")
+                    check(
+                        seed_fx is not None
+                        and seed_fx.gamut is not None
+                        and seed_fx.gamut.inherited_from is None,
+                        f"{fctx}.gamut: inherited_from '{seed_id}' is not a measured fixture",
+                    )
+                    check(
+                        seed_mat is None
+                        or fx_mat is None
+                        or (fx_mat.model is not None and fx_mat.model == seed_mat.model),
+                        f"{fctx}.gamut: inherited_from '{seed_id}' does not carry the same "
+                        f"material model label",
+                    )
         for gid, g in room.groups.items():
             gctx = f"{ctx}.groups.{gid}"
             check(g.transport in m.transports, f"{gctx}: transport '{g.transport}' is not declared")
@@ -872,7 +1029,21 @@ def validate(m: HomeModel) -> list[str]:
                 pres.coalesce_ms is None or pres.coalesce_ms > 0,
                 f"{pctx}: coalesce_ms must be positive when set",
             )
-        check(room.vacancy.seconds > 0, f"{ctx}.vacancy: seconds must be positive")
+        check(
+            room.space is None or room.space in m.spaces,
+            f"{ctx}: space '{room.space}' is not declared",
+        )
+        if room.vacancy.scope == "space":
+            check(room.space is not None, f"{ctx}.vacancy: scope 'space' but the room is in none")
+            check(
+                room.vacancy.seconds is None,
+                f"{ctx}.vacancy: seconds belong to the space when scope is 'space'",
+            )
+        else:
+            check(
+                room.vacancy.seconds is not None and room.vacancy.seconds > 0,
+                f"{ctx}.vacancy: a room-scoped vacancy needs positive seconds",
+            )
         seen: dict[str, str] = {}
         for sgid, sg in room.scene_groups.items():
             sctx = f"{ctx}.scene_groups.{sgid}"
@@ -927,9 +1098,20 @@ def validate(m: HomeModel) -> list[str]:
             f"{ctx}: ambient_scope '{room.ambient_scope}' is not declared",
         )
         check(
-            room.cls == "non_main" or room.pattern == "A",
-            f"{ctx}: pattern C is a non-main behaviour",
+            room.space is None or room.pattern == "A",
+            f"{ctx}: pattern C is a behaviour of rooms outside any space",
         )
+
+    for sid, space in m.spaces.items():
+        sctx = f"spaces.{sid}"
+        check(space.vacancy_s > 0, f"{sctx}: vacancy_s must be positive")
+        check(
+            any(room.space == sid for room in m.rooms.values()),
+            f"{sctx}: no room declares this space",
+        )
+        for src in space.extra_presence:
+            check(src in m.sensors, f"{sctx}: extra_presence '{src}' is not a declared sensor")
+            check(src not in lux_sensor_ids, f"{sctx}: '{src}' is a lux sensor, not presence")
 
     for zid, z in m.zones.items():
         zctx = f"zones.{zid}"
@@ -1000,7 +1182,35 @@ def validate(m: HomeModel) -> list[str]:
                 )
     check(m.scenes.tick.linger_s > 0, "scenes.tick.linger_s must be positive")
     check(0 < m.solar.solstice_blend_frac <= 1.0, "solar.solstice_blend_frac must be in (0, 1]")
+    # Two measured units of one model label must agree: a larger gap is a wrong measurement
+    # or a wrong label, and either would put a wrong polygon under the comparators.
+    first_of_label: dict[str, tuple[str, Gamut]] = {}
+    for rid, room in m.rooms.items():
+        for fid, fx in room.fixtures.items():
+            fx_material = m.materials.get(fx.material)
+            if fx.gamut is None or fx.gamut.inherited_from is not None:
+                continue
+            if fx_material is None or fx_material.model is None:
+                continue
+            first = first_of_label.setdefault(fx_material.model, (fid, fx.gamut))
+            if first[0] == fid:
+                continue
+            gap = vertex_deviation(fx.gamut.vertices, first[1].vertices)
+            check(
+                gap <= SAME_MODEL_FAIL,
+                f"rooms.{rid}.fixtures.{fid}.gamut: differs from {first[0]} by {gap:.4f} "
+                f"although both carry the material model '{fx_material.model}' "
+                f"(limit {SAME_MODEL_FAIL})",
+            )
     return errs
+
+
+def _find_fixture(m: HomeModel, fixture_id: str) -> Fixture | None:
+    for room in m.rooms.values():
+        fx = room.fixtures.get(fixture_id)
+        if fx is not None:
+            return fx
+    return None
 
 
 def load(text: str) -> HomeModel:
@@ -1036,7 +1246,7 @@ def to_dict(m: HomeModel) -> dict[str, Any]:
 
     def room(r: Room) -> dict[str, Any]:
         return {
-            "class": r.cls,
+            "space": r.space,
             "pattern": r.pattern,
             "vacancy": {"scope": r.vacancy.scope, "seconds": r.vacancy.seconds},
             "presence": presence(r.presence),
@@ -1050,6 +1260,21 @@ def to_dict(m: HomeModel) -> dict[str, Any]:
                     "address": f.address,
                     "scene_group": f.scene_group,
                     "palette_stride": f.palette_stride,
+                    **(
+                        {}
+                        if f.gamut is None
+                        else {
+                            "gamut": {
+                                "vertices": _xy_list(f.gamut.vertices),
+                                "bound_to": f.gamut.bound_to,
+                                "measured": f.gamut.measured,
+                                "model_error": f.gamut.model_error,
+                                "clip_rule": f.gamut.clip_rule,
+                                "inherited_from": f.gamut.inherited_from,
+                                "firmware": f.gamut.firmware,
+                            }
+                        }
+                    ),
                 }
                 for fid, f in r.fixtures.items()
             },
@@ -1141,6 +1366,14 @@ def to_dict(m: HomeModel) -> dict[str, Any]:
                 }
                 for sid, s in m.sensors.items()
             },
+            "spaces": {
+                sid: {
+                    "vacancy_s": s.vacancy_s,
+                    "extra_presence": list(s.extra_presence),
+                    "wake_relight": s.wake_relight,
+                }
+                for sid, s in m.spaces.items()
+            },
             "rooms": {rid: room(r) for rid, r in m.rooms.items()},
             "zones": {
                 zid: {
@@ -1199,6 +1432,50 @@ def to_dict(m: HomeModel) -> dict[str, Any]:
 
 def dumps(m: HomeModel) -> str:
     return yaml.safe_dump(to_dict(m), sort_keys=False, allow_unicode=True)
+
+
+def fixture_gamut(m: HomeModel, fixture_id: str) -> tuple[XY, ...]:
+    """The polygon of a fixture (measured or inherited), or an empty tuple (the identity) when
+    it has none or is unknown. Fixture ids are unique across rooms."""
+    fx = _find_fixture(m, fixture_id)
+    return () if fx is None or fx.gamut is None else fx.gamut.vertices
+
+
+def fixture_clip(m: HomeModel, fixture_id: str) -> tuple[tuple[XY, ...], ClipRule]:
+    """The polygon AND the clip rule a comparator needs for a fixture; ``((), "closest")``,
+    the identity, when it has no gamut."""
+    fx = _find_fixture(m, fixture_id)
+    if fx is None or fx.gamut is None:
+        return (), "closest"
+    return fx.gamut.vertices, fx.gamut.clip_rule
+
+
+def fixture_model_label(m: HomeModel, fixture_id: str) -> str | None:
+    """The model label of a fixture's material, the author's declaration of what hardware it
+    is; None when the fixture is unknown or its material carries no label."""
+    fx = _find_fixture(m, fixture_id)
+    if fx is None:
+        return None
+    mat = m.materials.get(fx.material)
+    return None if mat is None else mat.model
+
+
+def with_fixture_gamut(m: HomeModel, fixture_id: str, gamut: Gamut | None) -> HomeModel:
+    """A copy of the model with one fixture's gamut set (or cleared). The measurement writes
+    the model the way the tuning UI does; nothing in the model is mutated in place."""
+    for rid, room in m.rooms.items():
+        if fixture_id in room.fixtures:
+            fixtures = dict(room.fixtures)
+            fixtures[fixture_id] = replace(fixtures[fixture_id], gamut=gamut)
+            rooms = dict(m.rooms)
+            rooms[rid] = replace(room, fixtures=fixtures)
+            return replace(m, rooms=rooms)
+    raise KeyError(fixture_id)
+
+
+def space_rooms(m: HomeModel, space_id: str) -> tuple[str, ...]:
+    """The rooms that declare membership of a space, in model order."""
+    return tuple(rid for rid, room in m.rooms.items() if room.space == space_id)
 
 
 def consumer_envelopes(m: HomeModel) -> dict[str, int | None]:

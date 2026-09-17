@@ -7,9 +7,32 @@ reach. Everything else is discovered by building against the reference installat
 ## 1. A standalone engine behind adapter boundaries
 
 The engine reproduces a home's lighting from a declarative model, for any home. Home Assistant is
-the front door and exactly one adapter: a transport for commands and a source of signals. The core
-never sees a Home Assistant entity, an MQTT topic or a device model, so a deployment with no Home
-Assistant in it, a professional control plane driven directly, or an appliance all stay possible.
+the front door and one adapter among several: a transport for commands and a source of signals. The
+core never sees a Home Assistant entity, an MQTT topic or a device model.
+
+**Rationale restated 2026-09-10.** This used to be justified by keeping non-HA deployments possible.
+That is optionality for uncommitted rungs, it reads as speculative generality, and it is not why the
+boundary holds. Three committed reasons:
+
+- **HA is not the only transport, even inside the add-on.** The container drives Zigbee2MQTT
+  directly for fidelity — group topics, publish clocks, drop gates — and that path touches no HA
+  entity. A core shaped around HA entities would be wrong for the transport that matters most.
+- **§4's resilience model** puts the engine in its own always-on process with reflex bindings
+  beneath it, so Tier 2, engine down, still gives complete manual control. That is a deployment
+  shape, not a packaging choice.
+- **Testability.** The simulation harness, the preview evaluator and golden replay are each a
+  function of model plus clock. Coupling the core to HA's state machine puts an HA instance, or a
+  mock of one, inside every test.
+
+That a deployment with no Home Assistant in it, a professional control plane driven directly, or an
+appliance all stay possible is a *consequence* of the boundary. Do not defend it on that ground.
+
+⚠️ **This is a rule about where HA-shaped data is TRANSLATED, not a refusal to read it.** Adapters
+read Home Assistant's device, area and entity registries, and each transport's own topology
+(Zigbee2MQTT's retained `bridge/groups` and `bridge/devices`, ZHA's group API, a Hue bridge's
+groups), and populate the Home Model from what they find. Discovery in the adapter is the plan, not
+an exception to it; misreading this rule as "the engine may not consume HA's registries" would block
+it.
 
 ## 2. The Home Model is the hub
 

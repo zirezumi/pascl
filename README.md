@@ -38,6 +38,9 @@ Three layers with purity as a hard requirement, described in [docs/architecture.
 a pure render core, a deterministic estimator, and an impure shell. Time enters the first two only
 through an injected clock, and `tests/test_purity.py` fails the build if that ever changes.
 
+The first calibration the engine runs on its own is the colour gamut of each fixture, measured on
+the device rather than looked up by brand: [docs/gamut.md](docs/gamut.md).
+
 ## Developing
 
 Python 3.12 or newer and [uv](https://docs.astral.sh/uv/).

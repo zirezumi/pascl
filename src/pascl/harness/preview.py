@@ -15,7 +15,7 @@ from typing import Final
 from zoneinfo import ZoneInfo
 
 from pascl.core import solar
-from pascl.core.palette import NaturalWhite, natural_white
+from pascl.core.palette import NaturalWhite, default_warm_offset, natural_white
 from pascl.core.render import FixtureState, Frame, Phase, RoomState, SolarState, render_room
 from pascl.core.solar import Site
 from pascl.model import HomeModel
@@ -32,7 +32,8 @@ class PreviewInputs:
     scene_bindings: Mapping[str, str] = field(default_factory=dict)
     scene_offset: int = 0
     sleeping: bool = False
-    warm_offset_k: float = 0.0
+    warm_offset_k: float | None = None
+    """The live warm offset; None takes the model's declared default."""
 
 
 DEFAULT_INPUTS: Final = PreviewInputs()
@@ -74,6 +75,9 @@ def preview(
 ) -> PreviewResult:
     sol = solar_state(model, at)
     white = natural_white(sol.progress, sol.factor, sol.pct)
+    warm_offset = (
+        default_warm_offset(model) if inputs.warm_offset_k is None else inputs.warm_offset_k
+    )
     frames: dict[str, Frame] = {}
     for rid in model.rooms:
         state = RoomState(
@@ -92,7 +96,7 @@ def preview(
                 white,
                 inputs.scene_bindings,
                 inputs.scene_offset,
-                inputs.warm_offset_k,
+                warm_offset,
             )
         )
     return PreviewResult(at=at, solar=sol, white=white, frames=frames)

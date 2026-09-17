@@ -143,6 +143,7 @@ def render_fixture(
                 scene_offset,
                 room.palette_base,
                 fx.palette_stride,
+                warm_offset_k,
             )
         else:
             goal_xy = natural_anchor
@@ -181,7 +182,10 @@ def render_fixture(
         goal_ct = kelvin_to_mired(round(warm_k))
         use_ct = goal_ct <= ceiling_mired
 
-    # A colour-temperature flavoured override on a bulb.
+    # A colour-temperature flavoured override on a bulb. The baseline it blends from is a colour
+    # temperature only while it sits on one of the white anchors AND that temperature is within
+    # the bulb's range; a night white below the bulb's floor is xy, and the override then only
+    # takes the wire as a colour temperature once it has fully won.
     if (
         fx_state.override_is_ct
         and is_bulb
@@ -190,20 +194,15 @@ def render_fixture(
         and "cct" in material.capabilities
         and baseline_xy is not None
     ):
-        baseline_ct = (
-            natural_bulb is not None and _near(baseline_xy, natural_bulb, CT_TOLERANCE_ENTER)
-        ) or (warm_bulb is not None and _near(baseline_xy, warm_bulb, CT_TOLERANCE_ENTER))
+        on_natural = natural_bulb is not None and _near(
+            baseline_xy, natural_bulb, CT_TOLERANCE_ENTER
+        )
+        on_warm = warm_bulb is not None and _near(baseline_xy, warm_bulb, CT_TOLERANCE_ENTER)
+        base_k = white.kelvin_rounded if on_natural else round(warm_k)
+        baseline_mired = kelvin_to_mired(base_k)
+        baseline_ct = (on_natural or on_warm) and baseline_mired <= ceiling_mired
         override_mired = kelvin_to_mired(fx_state.override_kelvin)
         if baseline_ct:
-            base_k = (
-                white.kelvin_rounded
-                if (
-                    natural_bulb is not None
-                    and _near(baseline_xy, natural_bulb, CT_TOLERANCE_ENTER)
-                )
-                else round(warm_k)
-            )
-            baseline_mired = kelvin_to_mired(base_k)
             goal_ct = int(baseline_mired + cf * (override_mired - baseline_mired))
             use_ct = True
         elif cf >= 1.0:

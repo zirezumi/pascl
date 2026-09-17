@@ -28,6 +28,10 @@ dependencies = ["astral>=2.2,<3", "pyyaml>=6"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11", "types-PyYAML"]
+# The Home Assistant MQTT link (pascl.shell.ha_mqtt) subscribes over HA's WebSocket API.
+ha = ["websockets>=12"]
+# The direct broker link (pascl.shell.paho_mqtt) for a runtime that owns its connection.
+mqtt = ["paho-mqtt>=2"]
 
 [project.urls]
 Homepage = "https://github.com/zirezumi/pascl"
@@ -61,7 +65,7 @@ packages = ["pascl"]
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["astral", "astral.*"]
+module = ["astral", "astral.*", "websockets", "websockets.*", "paho", "paho.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

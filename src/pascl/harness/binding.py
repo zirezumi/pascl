@@ -5,8 +5,9 @@ names. The engine never learns those names; instead a binding file declares, onc
 installation, the naming patterns that turn a model id into the host's ids, and this module
 expands those patterns over a model into a reverse index from observed id to engine path.
 
-Patterns use placeholders: ``{fixture}``, ``{room}``, ``{group}``, ``{scene_group}``,
-``{scope}``, ``{sensor}``, ``{anchor}``, ``{palette}``, ``{address}``, ``{base_topic}``.
+Patterns use placeholders: ``{fixture}``, ``{room}``, ``{group}``, ``{space}``,
+``{scene_group}``, ``{scope}``, ``{sensor}``, ``{anchor}``, ``{palette}``, ``{address}``,
+``{base_topic}``.
 An observed id may name an attribute with ``#``, as in ``sensor.fusion_{scope}#coupling``.
 Irregular names are pinned per path under ``overrides``. Palette display names map to palette
 ids under ``palette_names``.
@@ -15,7 +16,7 @@ ids under ``palette_names``.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -86,11 +87,40 @@ _GLOBAL: dict[str, tuple[str, TargetKind, Transform]] = {
     "palette_json": ("scene.palette.{palette}", "input", "json"),
     "scene_transition_s": ("scene.transition_s", "input", "float"),
     "scene_linger_s": ("scene.linger_s", "input", "float"),
+    "warm_offset": ("scene.warm_offset_k", "input", "float"),
     "ambient_accumulator": ("ambient.accumulator", "input", "float"),
     "ambient_weather": ("ambient.weather", "input", "bool"),
-    "main_space_vacancy_timer": ("vacancy.main_space", "input", "timer"),
+    # The white anchors the reference RENDERED for the current solar position: the natural
+    # white it reads as a colour temperature and as xy per material class, and the same for
+    # the warm-offset white. A room's render reads these values, not the solar clock, so a
+    # replay that recomputes them from `solar.progress` can differ from the recording by the
+    # reference's own update cadence; recorded, the comparison can use the value read.
+    "natural_kelvin": ("scene.natural.kelvin", "input", "float"),
+    "natural_bulb_x": ("scene.natural.bulb_x", "input", "float"),
+    "natural_bulb_y": ("scene.natural.bulb_y", "input", "float"),
+    "natural_strip_x": ("scene.natural.strip_x", "input", "float"),
+    "natural_strip_y": ("scene.natural.strip_y", "input", "float"),
+    "warm_kelvin": ("scene.warm.kelvin", "input", "float"),
+    "warm_bulb_x": ("scene.warm.bulb_x", "input", "float"),
+    "warm_bulb_y": ("scene.warm.bulb_y", "input", "float"),
+    "warm_strip_x": ("scene.warm.strip_x", "input", "float"),
+    "warm_strip_y": ("scene.warm.strip_y", "input", "float"),
 }
-_SECTIONS = ("fixture", "group", "room", "scene_group", "ambient_scope", "sensor", "global")
+_SPACE: dict[str, tuple[str, TargetKind, Transform]] = {
+    "presence": ("spaces.{space}.presence", "input", "bool"),
+    "vacancy_timer": ("spaces.{space}.vacancy_timer", "input", "timer"),
+    "dial_active": ("spaces.{space}.dial_active", "input", "bool"),
+}
+_SECTIONS = (
+    "fixture",
+    "group",
+    "room",
+    "space",
+    "scene_group",
+    "ambient_scope",
+    "sensor",
+    "global",
+)
 
 
 @dataclass(frozen=True)
@@ -165,6 +195,14 @@ def expand(binding: Binding, model: HomeModel) -> Index:
 
     for rid, room in model.rooms.items():
         for key, (tpl, kind, tr) in _ROOM.items():
+            # A room pattern is only expanded for a room the model says has that thing: a
+            # room on its space's timer owns no timer of its own, and a room without a switch
+            # zone has no composite for one. Emitting them anyway put ids in the index that no
+            # host could ever have produced.
+            if key == "vacancy_timer" and room.vacancy.scope == "space":
+                continue
+            if key == "switch_zone" and room.switch_zone is None:
+                continue
             emit("room", key, _fill(tpl, room=rid), kind, tr, room=rid)
         for fid, fx in room.fixtures.items():
             base = model.transports[fx.transport].base_topic or ""
@@ -205,6 +243,9 @@ def expand(binding: Binding, model: HomeModel) -> Index:
                     scene_group=sgid,
                     room=rid,
                 )
+    for sid in model.spaces:
+        for key, (tpl, kind, tr) in _SPACE.items():
+            emit("space", key, _fill(tpl, space=sid), kind, tr, space=sid)
     for sid in model.ambient_scopes:
         for key, (tpl, kind, tr) in _SCOPE.items():
             emit("ambient_scope", key, _fill(tpl, scope=sid), kind, tr, scope=sid)
@@ -222,6 +263,18 @@ def expand(binding: Binding, model: HomeModel) -> Index:
         else:
             emit("global", key, tpl, kind, tr)
     return idx
+
+
+def unbound_live(index: Index, live_ids: Iterable[str]) -> list[str]:
+    """The entity ids this index expects that the host does not have.
+
+    ``live_ids`` is the host's own list of entity ids (however it was obtained; the engine
+    never asks a host). A non-empty result means the binding names something the host calls
+    differently, or the model declares something the host lacks; either way a recording could
+    never feed that path, and an assembler audit cannot see it because nothing is unplaced.
+    """
+    live = set(live_ids)
+    return sorted(eid for eid in index.entities if eid not in live)
 
 
 def transform_value(
@@ -248,7 +301,12 @@ def transform_value(
         except (TypeError, ValueError):
             return None
     if transform == "timer":
-        return str(state)
+        # A host timer's idle state means two different things: it expired, or it was cancelled
+        # because presence came back. Hosts that say which (Home Assistant's `last_transition`)
+        # have it carried as `idle:finished` / `idle:cancelled`; the replay reads the first part
+        # as the state and the second, when present, as why.
+        why = (attrs or {}).get("last_transition")
+        return f"{state}:{why}" if why else str(state)
     if transform == "palette":
         name = str(state)
         return palette_ids.get(name, name.lower().replace(" ", "_"))

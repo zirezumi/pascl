@@ -13,26 +13,38 @@ within tolerance with no home-specific code.
 
 from pascl.model.schema import (
     SCHEMA_VERSION,
+    Gamut,
     HomeModel,
     ModelError,
     consumer_envelopes,
     dumps,
+    fixture_clip,
+    fixture_gamut,
+    fixture_model_label,
     from_dict,
     load,
     loads,
+    space_rooms,
     to_dict,
     validate,
+    with_fixture_gamut,
 )
 
 __all__ = [
     "SCHEMA_VERSION",
+    "Gamut",
     "HomeModel",
     "ModelError",
     "consumer_envelopes",
     "dumps",
+    "fixture_clip",
+    "fixture_gamut",
+    "fixture_model_label",
     "from_dict",
     "load",
     "loads",
+    "space_rooms",
     "to_dict",
     "validate",
+    "with_fixture_gamut",
 ]

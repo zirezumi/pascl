@@ -1,9 +1,10 @@
-# A small synthetic home that exercises every section of schema v0. It is not a real place.
-# Two rooms: a main-space den on a Zigbee2MQTT transport with a plate, a switch-proximity zone
-# and two scene groups; and a pantry, a non-main room whose presence is a motion-seeded latch
-# and whose occupancy sensor arrives pre-fused through a Home Assistant bridge.
+# A small synthetic home that exercises every section of the schema. It is not a real place.
+# Two rooms: a den that belongs to the open-plan `house` space (one shared vacancy timer), on a
+# Zigbee2MQTT transport with a plate, a switch-proximity zone and two scene groups; and a
+# pantry that stands alone on its own timer, whose presence is a motion-seeded latch and whose
+# occupancy sensor arrives pre-fused through a Home Assistant bridge.
 home_model:
-  version: 0
+  version: 1
   id: demo
   location: { latitude: 47.61, longitude: -122.33, elevation_m: 50, tz: America/Los_Angeles }
   solar: { solstice_blend_frac: 0.775, tick_s: 45 }
@@ -30,10 +31,13 @@ home_model:
     pantry_occupancy:   { modality: generic,          transport: ha,                                    address: binary_sensor.pantry_occupancy }
     pantry_pir_lux:     { modality: lux,              transport: z2m-1, device: pantry_motion,          address: pantry_motion/illuminance }
 
+  spaces:
+    house: { vacancy_s: 600, wake_relight: all_dark }
+
   rooms:
     den:
-      class: main
-      vacancy: { scope: main_space, seconds: 600 }
+      space: house
+      vacancy: { scope: space }
       presence:
         sources: [den_plate_mmwave_1, den_radar_zone_1]
         fusion: or
@@ -66,7 +70,6 @@ home_model:
       sleep: suppress
 
     pantry:
-      class: non_main
       pattern: A
       vacancy: { scope: room, seconds: 15 }
       presence:
