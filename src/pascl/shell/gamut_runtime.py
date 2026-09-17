@@ -4,9 +4,12 @@ One tick: read the host (which fixtures are lit, which rooms occupied, which dev
 behind each fixture), let ``pick_target`` name the next dark fixture in an empty room, measure
 it, record the result in the model, and let the measurement travel to its same-model
 siblings as seeds. Nothing is visible: a dark fixture accepts colour silently and is put back
-afterwards, and the measurement aborts the moment the fixture lights or the room fills. The
-tick is a function so the add-on can call it on a timer, an automation can call it once, and
-a test can call it against fakes; ``run`` is the loop the command line offers.
+afterwards, and the measurement aborts the moment the fixture lights or the room fills. A
+device that does not accept colour while dark is diagnosed on its first samples and set
+aside with the reason (the forced mode switches it on to measure it), as is one that never
+answers or never settles. The tick is a function so the add-on can call it on a timer, an
+automation can call it once, and a test can call it against fakes; ``run`` is the loop the
+command line offers.
 
 The host is reached through the same binding the replay uses: the light entity behind a
 fixture and the presence entity behind a room are whatever the binding says they are, so this
@@ -33,7 +36,15 @@ from pascl.estimator.gamut import (
 )
 from pascl.harness.binding import Index
 from pascl.model import HomeModel, dumps, validate, with_fixture_gamut
-from pascl.shell.gamut_measure import DeviceChannel, gamut_from, measure
+from pascl.shell.gamut_measure import (
+    NEVER_SETTLES,
+    NO_READ_ANSWER,
+    NOT_APPLIED_LIT,
+    NOT_APPLIED_WHILE_OFF,
+    DeviceChannel,
+    gamut_from,
+    measure,
+)
 from pascl.shell.ha_light import HALightChannel
 from pascl.shell.z2m import DeviceInfo, MqttLink, Z2MDeviceChannel, bridge_devices
 
@@ -266,7 +277,12 @@ def tick(
     notes = list(verdict.notes)
     gamut = gamut_from(verdict, channel, clk)
     if gamut is None:
-        return model, Tick(pick, verdict, notes=tuple(notes), remaining=remaining)
+        # a diagnosis about the device itself is final for this run: colour it will not
+        # apply while off (the forced mode switches it on), or not at all, or too slowly
+        aside = verdict.aborted is not None and verdict.aborted.startswith(
+            (NOT_APPLIED_WHILE_OFF, NOT_APPLIED_LIT, NEVER_SETTLES)
+        )
+        return model, Tick(pick, verdict, notes=tuple(notes), remaining=remaining, set_aside=aside)
     held = model.rooms[pick.room].fixtures[pick.fixture].gamut
     seed_gap: float | None = None
     if held is not None and held.inherited_from is not None:
@@ -304,14 +320,23 @@ def run(
     """The loop: a tick, then interval_s of rest, until every colour fixture is measured
     on its own device, or just one tick with once (what a scheduler or an automation
     calls). A tick that finds nothing dark and empty is not the end: it is rest. A fixture a
-    tick set aside (no way in, or a transport that needs the forced mode) is not picked
-    again in this run."""
+    tick set aside (no way in, a transport that needs the forced mode, or a device the
+    measurement diagnosed) is not picked again in this run; one that answered no read-back
+    is given a second tick, since a busy transport looks the same, and set aside after."""
     set_aside: set[str] = set()
+    silent: dict[str, int] = {}
     while True:
         model, result = tick(model, index, host, write=write, exclude=set_aside, force=force)
         report(result)
-        if result.set_aside and result.picked is not None:
-            set_aside.add(result.picked.fixture)
+        if result.picked is not None:
+            name = result.picked.fixture
+            if result.set_aside:
+                set_aside.add(name)
+            reason = result.verdict.aborted if result.verdict is not None else None
+            if reason is not None and reason.startswith(NO_READ_ANSWER):
+                silent[name] = silent.get(name, 0) + 1
+                if silent[name] >= 2:
+                    set_aside.add(name)
         if once or (result.picked is None and result.remaining <= len(set_aside)):
             return model
         sleep(interval_s)

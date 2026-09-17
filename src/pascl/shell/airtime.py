@@ -57,11 +57,12 @@ class Window:
         return max(1, int(self.size))
 
     def observe(self, sample: Sample) -> None:
-        """Feed one sample's evidence. Good: answered on the first read within the budget."""
+        """Feed one sample's evidence. Good: answered on the first read within the budget
+        (the confirming read-back is not a retry)."""
         self.samples += 1
         good = (
             sample.trusted
-            and sample.reads <= 1
+            and sample.retries == 0
             and sample.latency is not None
             and sample.latency <= LATENCY_BUDGET
         )
@@ -74,8 +75,9 @@ class Window:
                 self.streak = 0
                 self.history.append(self.slots)
                 self.peak = max(self.peak, self.slots)
-        elif sample.foreign or sample.lit or sample.occupied:
-            # a foreign command or an interruption says nothing about airtime
+        elif sample.foreign or sample.lit or sample.occupied or sample.unapplied or sample.moved:
+            # a foreign command, an interruption, or a device that answered promptly but had
+            # not applied or settled says nothing about airtime
             return
         else:
             self.streak = 0

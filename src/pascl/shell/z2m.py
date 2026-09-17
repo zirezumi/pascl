@@ -14,6 +14,10 @@ Rules the reference installation's fleet taught, each one a measurement that wen
   the echo, and the unsuffixed value is then republished, stale, with every later message. It
   is taken only after this sample's read went out and only if it differs from every unsuffixed
   value seen earlier in the sample.
+* A read answered with the colour from before the command is passed on as ``unapplied``:
+  the read landed early, or the device does not apply colour while off (Hue does; many others
+  do not). The driver reads again, and in the forced mode switches such a device on
+  (``light_up``: ``state: ON``) and turns it off again after (``restore``, colour first).
 * A ``/set`` on the device's own topic that this channel did not send is a foreign command
   (a render, a repaint); the sample is reported as such and the driver takes it again.
 * Every state message carries the endpoint's ``state``; ``ON`` during a measurement of a
@@ -236,6 +240,7 @@ class Z2MDeviceChannel:
         self._seen_unsuffixed: list[XY] = []
         self._before: dict[str, object] | None = None
         self._last_seen: XY | None = None
+        self._lit_by_us = False
         self._watch = frozenset(watch) - {set_topic}
         self._occupancy = frozenset(occupancy)
         link.subscribe(self._base)
@@ -324,7 +329,30 @@ class Z2MDeviceChannel:
             return None
         return view.get("state") == "ON"
 
+    def light_up(self) -> bool:
+        """Switch the fixture on (its own brightness) for a visible measurement of a device
+        that keeps its colour while off; ``restore`` turns it off again."""
+        payload = json.dumps({"state": "ON", "transition": 0})
+        self._sent.append(payload)
+        self._lit_by_us = True
+        self._link.publish(self._set_topic, payload)
+        return True
+
     def restore(self, transition: float = 0.2) -> None:
+        """The colour it had, then off again if the measurement switched it on: the colour
+        goes first, while the fixture is on, because a device measured lit is one that keeps
+        its colour while off and would otherwise come back on showing the last probe."""
+        self.restore_colour(transition)
+        if self._lit_by_us:
+            self._lit_by_us = False
+            self._link.publish(
+                self._set_topic, json.dumps({"state": "OFF", "transition": transition})
+            )
+
+    def restore_colour(self, transition: float = 0.2) -> None:
+        """Put the snapshot's colour (or colour temperature) back over ``transition``
+        seconds. An installation with its own idea of where a fixture should rest (a cached
+        intent) overrides this."""
         before = self._before
         if before is None:
             return
@@ -389,10 +417,12 @@ class Z2MDeviceChannel:
         transport republishes the whole state on any change, and a late answer to an earlier
         read carries the resting colour). After the read, the message carries what the device
         answered, so even the command's own value means the device reached it and is reported
-        as the device's own, trusted (a probe inside the true gamut is answered exactly). On a
-        multi-endpoint device the endpoint key keeps the echo throughout and only the
-        unsuffixed key carries the read answer, taken once it has moved from what the sample
-        saw before the read."""
+        as the device's own, trusted (a probe inside the true gamut is answered exactly),
+        except the colour from before the command: that read landed before the device applied
+        it, or the device never will, and it is reported as ``unapplied`` for the driver to
+        read again and to judge. On a multi-endpoint device the endpoint key keeps the echo
+        throughout and only the unsuffixed key carries the read answer, taken once it has
+        moved from what the sample saw before the read."""
         cmd = self._command
         if cmd is None:
             return None
@@ -408,6 +438,8 @@ class Z2MDeviceChannel:
                 elif not any(_near(alt, v) for v in self._seen_unsuffixed):
                     self._last_seen = alt
                     return Observation("device", alt, trusted=True)
+                elif self._unapplied(alt):
+                    return Observation("unapplied", alt)
             if value is None or _near(value, cmd):
                 return None if value is None else Observation("echo")
             self._last_seen = value
@@ -419,13 +451,18 @@ class Z2MDeviceChannel:
                 return Observation("echo")
             if self._last_seen is not None and _near(value, self._last_seen):
                 return None  # the colour it already showed: not an answer to this command
-        elif (
-            self._pre_command is not None
-            and _near(value, self._pre_command)
-            and not _near(value, cmd)
-        ):
-            # the read landed before the device applied the command: it still shows what it
-            # showed before, and the driver reads again
-            return None
+        elif self._unapplied(value):
+            return Observation("unapplied", value)
         self._last_seen = value
         return Observation("device", value, trusted=self._read_sent)
+
+    def _unapplied(self, value: XY) -> bool:
+        """A read-back showing the colour from before the command (and not the command's own
+        value, which a device resting where the command clips to would show either way)."""
+        cmd = self._command
+        return (
+            cmd is not None
+            and self._pre_command is not None
+            and _near(value, self._pre_command)
+            and not _near(value, cmd)
+        )

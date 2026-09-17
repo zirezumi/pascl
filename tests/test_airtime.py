@@ -89,9 +89,12 @@ class LoadedCoordinator:
 
 def test_window_grows_on_prompt_answers_and_backs_off_on_a_retry() -> None:
     w = Window(ceiling=4)
-    good = Sample((0.5, 0.4), False, False, trusted=True, reads=1, latency=0.1)
-    slow = Sample((0.5, 0.4), False, False, trusted=True, reads=2, latency=0.9)
+    # two reads went out for a good sample: the first answered, the second confirmed it
+    good = Sample((0.5, 0.4), False, False, trusted=True, reads=2, latency=0.1, confirmed=True)
+    slow = Sample((0.5, 0.4), False, False, trusted=True, reads=3, latency=0.9, retries=1)
     interrupted = Sample(None, False, True)
+    unapplied = Sample(None, True, False, reads=7, unapplied=True)
+    settling = Sample(None, False, False, reads=6, latency=0.1, moved=True)
     for _ in range(GOOD_STREAK - 1):
         w.observe(good)
     assert w.slots == 1
@@ -101,6 +104,8 @@ def test_window_grows_on_prompt_answers_and_backs_off_on_a_retry() -> None:
         w.observe(good)
     assert w.slots == 3
     w.observe(interrupted)  # a foreign command says nothing about airtime
+    w.observe(unapplied)  # nor a device that answered every read with its resting colour
+    w.observe(settling)  # nor one still changing colour: its reads were answered
     assert w.slots == 3 and w.decreases == 0
     w.observe(slow)
     assert w.slots == 1 and w.decreases == 1 and w.history == [2, 3, 1]

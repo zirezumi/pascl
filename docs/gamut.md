@@ -65,11 +65,21 @@ disagrees with the wrong one on most answers, and nothing is trimmed from that d
 
 What the adapter has to provide, learned the hard way on the reference installation:
 
-* Command with a zero transition and obtain the device's **own** value. Spontaneous attribute
-  reports are not a reliable channel (some devices report at most once per ~10 s, some never);
-  a read of the colour attributes one second after the command answers on every device tried.
+* Command with a zero transition and obtain the device's **own** value by **reading** it.
+  Spontaneous attribute reports are not a channel at all: a Zigbee light reports colour only
+  when someone bound and configured that reporting, which Zigbee2MQTT does for on/off and
+  level but not for colour (the Hue lights that did report on the reference installation did
+  so through a leftover binding of Hue's private cluster, which Zigbee2MQTT stopped creating in
+  2026-05 because those reports carry in-between states). A read of the colour attributes
+  0.4 s after the command is answered by every device tried, in under 0.1 s.
+* Take an answer only once a **second read agrees** with it. A device with a ramp of its own
+  answers the first read part-way along it, and a single read would take that for the
+  device's clip; two that disagree mean it is still moving, and it is read again until two
+  agree or the sample runs out with no answer.
 * Recognise the transport's optimistic echo **by value** before the read, and trust the value
-  the read brings back even when it equals the command.
+  the read brings back even when it equals the command; the one exception is the colour from
+  before the command, which is the read landing early or a device that will never apply it
+  (``unapplied``), and is read again.
 * On a multi-endpoint device the read may land under the transport's unsuffixed key while the
   endpoint key keeps the echo, and be republished stale afterwards: take it only after your own
   read and only if it moved.
@@ -133,8 +143,9 @@ own, the way its daylight calibrator takes empty-and-dark windows. A gamut does 
 staleness is device identity, not age.
 
 **Invisible, or forced.** A dark fixture holds each probe colour only for the length of a
-sample (a read-back 0.4 s after the command, re-read if the device has not applied it yet; a
-fixture takes about fifteen seconds). Three things end a measurement early, restore the fixture
+sample (a read-back 0.4 s after the command and a second one at once to confirm it, re-read
+while the device has not applied or settled; a fixture takes about fifteen seconds). Three
+things end a measurement early, restore the fixture
 to its intended colour with *no* transition, and withhold the polygon: the room's presence
 entity turning on (watched through the host, ahead of the render that follows presence), a
 command that turns the fixture on (a foreign `state: ON` on its own topic or any group it is
@@ -145,12 +156,26 @@ milliseconds). The forced mode (`--force`) measures whatever the fixture's state
 is in the room, visibly; a transport that cannot carry colour to a dark fixture (section 7's
 entity channel) is measured in that mode only.
 
+**What a device can do wrong is diagnosed, not endured.** Consecutive probes clip to
+different places, so a device that answers its first two commands with the colour it was
+resting at has not applied either: it does not apply colour while off (Hue does, under its
+execute-if-off default; many other makes do not). The measurement stops there with that
+reason, and in the forced mode it instead switches the fixture on, starts over, puts the
+colour back and turns it off again (colour first, since such a device would otherwise come
+back on showing the last probe). Two more diagnoses end an opening the same way: no answer
+to any read-back (not reachable this way, which a busy transport can also look like, so the
+loop gives it a second tick before setting it aside) and a device still changing colour when
+every sample runs out (a ramp too slow to measure). Each is the verdict's `aborted`, with
+`NOT_APPLIED_WHILE_OFF`, `NOT_APPLIED_LIT`, `NO_READ_ANSWER` and `NEVER_SETTLES` as the
+prefixes a caller can test. Nothing here guesses: a device the measurement cannot read ends
+with no polygon and the identity comparator, never a wrong one.
+
 `pascl.shell.gamut_runtime.tick` is one pass: read the host through the binding (which light
 entities are on, which presence entities are on), read each coordinator's device list, pick,
 reach the fixture the way its transport allows (`channel_for`), measure with the room's
 presence watched, refuse a record the model would not validate with, write the model, let the
-measurement travel. `run` is the loop; a fixture a tick sets aside (no way in, or forced mode
-only) is not picked again in that run.
+measurement travel. `run` is the loop; a fixture a tick sets aside (no way in, forced mode
+only, or one of the diagnoses above) is not picked again in that run.
 
     HA_TOKEN=... pascl gamut auto --model home.yaml --binding binding.yaml \
         --ha-url http://homeassistant:8123 --write home.yaml [--interval 300] [--once] [--force]
@@ -175,13 +200,14 @@ with the device registry's software version as its firmware.
 ## 7. Running measurements (`pascl.shell`): channels, links, the hub
 
 The measurement talks to a fixture through a `DeviceChannel` (command a colour, read it back,
-observe, restore, identity, firmware, whether a dark fixture can be reached). Two channels
-exist:
+observe, restore, switch on for a forced measurement, identity, firmware, whether a dark
+fixture can be reached). Two channels exist:
 
-* `pascl.shell.z2m`, one Zigbee2MQTT light or endpoint: the `/set` and `/get` topics, the echo
-  and read-back rules, the endpoint rule, the foreign-command, lit and occupancy guards,
-  snapshot and restore. A colour reaches a dark device (and one that ignores it stays dark),
-  so this is the channel of the invisible measurement.
+* `pascl.shell.z2m`, one Zigbee2MQTT light or endpoint: the `/set` and `/get` topics, the echo,
+  read-back and unapplied rules, the endpoint rule, the foreign-command, lit and occupancy
+  guards, snapshot, `light_up` and restore. A colour reaches a dark device (and one that
+  ignores it stays dark and is diagnosed as such), so this is the channel of the invisible
+  measurement.
 * `pascl.shell.ha_light`, any light the host exposes as an entity (Matter, a Hue bridge, ZHA,
   Lutron's colour devices if any: the transport underneath does not matter): `light.turn_on`
   with no transition, `homeassistant.update_entity` to read back, the entity's state changes

@@ -254,7 +254,14 @@ class Probe:
     """
 
     def __init__(self, far_points: Iterable[XY] = FAR_POINTS) -> None:
-        self._queue: list[Step] = [Step("far", xy) for xy in far_points]
+        self._far = tuple(far_points)
+        self.reset()
+
+    def reset(self) -> None:
+        """Start over with the same far points: nothing answered, nothing noted. The adapter
+        uses it when the device's circumstances change part-way (switched on to be measured
+        lit, say) and what came before is not evidence about what follows."""
+        self._queue: list[Step] = [Step("far", xy) for xy in self._far]
         self._phase: Literal["far", "vertices", "edges", "done"] = "far"
         self._answers: list[tuple[Step, XY]] = []
         self._edge_answers: dict[tuple[XY, XY], XY] = {}

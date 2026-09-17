@@ -124,6 +124,12 @@ class HALightChannel:
             return None
         return before.get("state") == "on"
 
+    def light_up(self) -> bool:
+        """Every command through this channel turns the light on already; a device that
+        still keeps its resting colour is one that does not take an xy colour this way."""
+        self._link.call_service("light", "turn_on", {"entity_id": self._entity})
+        return True
+
     def restore(self, transition: float = 0.2) -> None:
         before = self._before
         if before is None:
@@ -191,7 +197,8 @@ class HALightChannel:
             and _near(value, self._pre_command)
             and not _near(value, cmd)
         ):
-            return None  # not applied yet; the driver reads again
+            # not applied yet, or never: the driver reads again and judges
+            return Observation("unapplied", value)
         self._last_seen = value
         return Observation("device", value, trusted=self._read_sent)
 

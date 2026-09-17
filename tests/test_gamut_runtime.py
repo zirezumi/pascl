@@ -21,8 +21,9 @@ from pascl.clock import ManualClock
 from pascl.core.gamut import XY, Polygon, project
 from pascl.harness.binding import expand, load_binding
 from pascl.model import HomeModel, load
-from pascl.shell.gamut_measure import measure
+from pascl.shell.gamut_measure import NOT_APPLIED_WHILE_OFF, measure
 from pascl.shell.gamut_runtime import (
+    Tick,
     command_topics,
     device_ids,
     device_infos,
@@ -44,13 +45,26 @@ FAR: Polygon = ((0.153185, 0.047547), (0.691493, 0.308293), (0.219986, 0.699992)
 class SimulatedHome:
     """An MQTT link plus REST states, with Zigbee2MQTT devices that clip to hidden polygons."""
 
-    def __init__(self, polygons: dict[str, Polygon], states: dict[str, str]) -> None:
+    def __init__(
+        self,
+        polygons: dict[str, Polygon],
+        states: dict[str, str],
+        *,
+        keeps_colour_off: set[str] | None = None,
+    ) -> None:
         self.polygons = polygons
         self.states = dict(states)
         self.inbox: list[tuple[str, str]] = []
         self.published: list[tuple[str, str]] = []
         self.subscribed: list[str] = []
         self.current: dict[str, XY] = {}
+        #: devices that ignore a colour command while off (no execute-if-off)
+        self.keeps_colour_off = keeps_colour_off or set()
+        self.lit: set[str] = {
+            e.removeprefix("light.")
+            for e, s in states.items()
+            if s == "on" and e.startswith("light.")
+        }
         self.devices = [
             {
                 "friendly_name": name,
@@ -71,17 +85,27 @@ class SimulatedHome:
         body = json.loads(payload)
         if name not in self.polygons:
             return
-        if verb == "set" and "color" in body:
+        state = "ON" if name in self.lit else "OFF"
+        if verb == "set" and "state" in body and "color" not in body:
+            if body["state"] == "ON":
+                self.lit.add(name)
+            else:
+                self.lit.discard(name)
+            state = "ON" if name in self.lit else "OFF"
+            x, y = self.current.get(name, (0.4, 0.4))
+            self.inbox.append((base, json.dumps({"state": state, "color": {"x": x, "y": y}})))
+        elif verb == "set" and "color" in body:
             xy = (float(body["color"]["x"]), float(body["color"]["y"]))
-            self.current[name] = project(xy, self.polygons[name])
-            self.inbox.append((base, json.dumps({"color": body["color"], "state": "OFF"})))
+            if name in self.lit or name not in self.keeps_colour_off:
+                self.current[name] = project(xy, self.polygons[name])
+            self.inbox.append((base, json.dumps({"color": body["color"], "state": state})))
         elif verb == "get" and "color" in body:
             x, y = self.current.get(name, (0.4, 0.4))
-            self.inbox.append((base, json.dumps({"color": {"x": x, "y": y}, "state": "OFF"})))
+            self.inbox.append((base, json.dumps({"color": {"x": x, "y": y}, "state": state})))
         elif verb == "get" and "state" in body:
             x, y = self.current.get(name, (0.4, 0.4))
             self.inbox.append(
-                (base, json.dumps({"state": "OFF", "color_mode": "xy", "color": {"x": x, "y": y}}))
+                (base, json.dumps({"state": state, "color_mode": "xy", "color": {"x": x, "y": y}}))
             )
 
     def subscribe(self, topic: str) -> None:
@@ -282,6 +306,74 @@ def test_tick_skips_lit_and_occupied_and_aborts_when_the_room_fills() -> None:
         t.verdict is not None and t.verdict.aborted is not None and "occupied" in t.verdict.aborted
     )
     assert m2 == model and not t.written
+
+
+def test_tick_sets_aside_a_device_that_keeps_its_colour_while_off_and_force_lights_it() -> None:
+    model = _model()
+    index = _index(model)
+    clock = _clock()
+    # the pendants are lit, so the strip is the pick; it ignores colour while off
+    states = {**DARK_EMPTY, "light.den_pendant_1": "on", "light.den_pendant_2": "on"}
+    home = SimulatedHome({"den_strip": TRIANGLE}, states, keeps_colour_off={"den_strip"})
+    m2, t = tick(model, index, home, write=None, clock=clock, channel_factory=_factory(clock))  # type: ignore[arg-type]
+    assert t.picked is not None and t.picked.fixture == "den_strip" and t.set_aside
+    assert t.verdict is not None and t.verdict.aborted is not None
+    assert t.verdict.aborted.startswith(NOT_APPLIED_WHILE_OFF) and m2 == model
+    assert "den_strip" not in home.lit  # never switched on outside the forced mode
+    probes = [p for p in home.published if p[0] == "z2m-1/den_strip/set" and "color" in p[1]]
+    assert len(probes) == 2 + 1  # two commands answered with the resting colour, the restore
+    # the loop does not pick it again: with the pendants lit the second tick finds nothing
+    # (and would keep resting, so the report stops the loop there)
+    ticks: list[Tick] = []
+    from pascl.shell import gamut_runtime
+
+    original = gamut_runtime.tick
+
+    def timed_tick(*args: object, **kw: object) -> object:
+        kw.setdefault("clock", clock)
+        kw.setdefault("channel_factory", _factory(clock))
+        return original(*args, **kw)  # type: ignore[arg-type]
+
+    class EnoughError(Exception):
+        pass
+
+    def report(t: Tick) -> None:
+        ticks.append(t)
+        if len(ticks) == 2:
+            raise EnoughError
+
+    gamut_runtime.tick = timed_tick  # type: ignore[assignment]
+    try:
+        run(model, index, home, write=None, interval_s=60, report=report, sleep=lambda _s: None)  # type: ignore[arg-type]
+    except EnoughError:
+        pass
+    finally:
+        gamut_runtime.tick = original
+    assert ticks[0].set_aside and ticks[1].picked is None
+    # forced: switched on, measured from the start, colour put back, then off again (the lit
+    # pendants are eligible in the forced mode, so they are set aside by hand here)
+    home = SimulatedHome({"den_strip": TRIANGLE}, states, keeps_colour_off={"den_strip"})
+    pendants = {"den_pendant_1", "den_pendant_2"}
+    m3, t = tick(
+        model,
+        index,  # type: ignore[arg-type]
+        home,
+        write=None,
+        clock=clock,
+        channel_factory=_factory(clock),
+        force=True,
+        exclude=pendants,
+    )
+    assert t.picked is not None and t.picked.fixture == "den_strip" and not t.set_aside
+    assert t.verdict is not None and t.verdict.polygon is not None
+    g = m3.rooms["den"].fixtures["den_strip"].gamut
+    assert g is not None
+    for hidden in TRIANGLE:
+        assert min(abs(hidden[0] - h[0]) + abs(hidden[1] - h[1]) for h in g.vertices) < 1e-5
+    assert any("switched on" in n for n in t.notes)
+    assert "den_strip" not in home.lit
+    tail = [p[1] for p in home.published if p[0] == "z2m-1/den_strip/set"][-2:]
+    assert "color" in tail[0] and json.loads(tail[1]) == {"state": "OFF", "transition": 0.2}
 
 
 def test_tick_refuses_a_record_the_model_would_not_validate_with() -> None:

@@ -9,11 +9,19 @@ same to it, and the only time it reads is the injected :class:`Clock`.
 Timing rules, all measured on the reference installation's fleet: a device applies a zero
 transition at once but may report the change late or never, so ``READ_AFTER`` seconds after
 the command the channel is asked to read the value back, again every ``READ_RETRY`` while the
-device has not answered (a read that lands before the device applied the command answers with
-the colour it showed before, which the channel does not pass on), and the read's answer ends
-the sample; a spontaneous report is a fallback that starts a ``SETTLE`` window in which a later
+device has not answered or answers with the colour it showed before the command (the channel
+passes that on as ``unapplied``). An answer is taken only once a second read agrees with it:
+a device with a ramp of its own answers a first read part-way and the two disagree, and the
+driver keeps reading until two in a row agree or the sample runs out, in which case it has no
+answer. A spontaneous report is a fallback that starts a ``SETTLE`` window in which a later
 value supersedes it; ``ANSWER_TIMEOUT`` bounds the whole sample; a foreign command on the
 device's own topic during a sample invalidates it, and it is taken once more.
+
+Three things a device can do on its very first samples are diagnosed rather than endured for
+a whole measurement, each with its reason in the verdict: keep its resting colour under every
+command (it does not apply colour while off; in the forced mode the driver switches it on and
+starts over, otherwise it says so and stops), answer nothing at all (not reachable this way),
+or still be changing colour when the sample runs out (a ramp too slow to measure).
 
 A measured fixture holds a probe colour for as long as a sample lasts, and a fixture that is
 turned on then shows that colour. Three things end a measurement early, all of them meant to
@@ -42,9 +50,13 @@ from pascl.model import Gamut
 #: within a Zigbee round trip, and every device tried answered a read in under 0.1 s.
 READ_AFTER: Final = 0.4
 #: Seconds between read-backs while the device has not answered (or answered with the colour
-#: it showed before the command, i.e. had not applied it yet).
+#: it showed before the command, i.e. had not applied it yet), and between two that disagree.
 READ_RETRY: Final = 0.4
+#: Read-backs that go unanswered before the driver stops asking within a sample.
 MAX_READS: Final = 3
+#: Read-backs in one sample while the device does answer but has not applied the command or
+#: has not settled: enough to span ANSWER_TIMEOUT at READ_RETRY.
+MAX_SETTLE_READS: Final = 7
 ANSWER_TIMEOUT: Final = 3.0
 SETTLE: Final = 1.5
 PAUSE: Final = 0.15
@@ -52,15 +64,26 @@ RETAKE_PAUSE: Final = 1.0
 POLL: Final = 0.1
 #: The shortest wait a channel is asked for; a real link has nothing useful to say sooner.
 MIN_WAIT: Final = 0.05
+#: Consecutive opening samples of one kind before the driver concludes something about the
+#: device: consecutive probes clip to different places, so a device that answers its resting
+#: colour twice running has not applied either command.
+DIAGNOSE_AFTER: Final = 2
+
+#: The abort reasons the driver diagnoses, as prefixes of ``Verdict.aborted``.
+NOT_APPLIED_WHILE_OFF: Final = "colour is not applied while the fixture is off"
+NOT_APPLIED_LIT: Final = "colour is not applied even with the fixture on"
+NO_READ_ANSWER: Final = "no answer to a colour read-back"
+NEVER_SETTLES: Final = "still changing colour when the sample ran out"
 
 
 @dataclass(frozen=True)
 class Observation:
     """One thing the channel saw: the device's own colour, the transport's echo of a command,
-    a command on this device's topic that the measurement did not send, the fixture being or
+    a read-back that still shows the colour from before the command (``unapplied``), a
+    command on this device's topic that the measurement did not send, the fixture being or
     reporting itself ON, or the room it lights becoming occupied."""
 
-    kind: Literal["device", "echo", "foreign", "lit", "occupied"]
+    kind: Literal["device", "echo", "unapplied", "foreign", "lit", "occupied"]
     xy: XY | None = None
     trusted: bool = False
     """The channel read this value back from the device, so it is the device's own even when
@@ -96,6 +119,11 @@ class DeviceChannel(Protocol):
     def observe(self, seconds: float) -> list[Observation]:
         """Block up to ``seconds`` and return what arrived, classified."""
 
+    def light_up(self) -> bool:
+        """Switch the fixture on so a device that keeps its colour while off can be measured
+        visibly (the forced mode); ``restore`` then turns it off again. False when the
+        transport cannot."""
+
     def restore(self, transition: float = 0.2) -> None:
         """Put the fixture back as it was before the measurement, over ``transition``
         seconds (zero on an abort: the intended colour must be there before a turn-on)."""
@@ -111,10 +139,21 @@ class Sample:
     """The value was read back from the device (see :class:`Observation`)."""
     occupied: bool = False
     reads: int = 0
-    """How many read-backs went out: more than one means the device was slow to apply or to
-    answer, the first sign of a transport with no airtime to spare."""
+    """How many read-backs went out in all, the confirming one included."""
     latency: float | None = None
-    """Seconds from the first read-back to the trusted answer; None without one."""
+    """Seconds from the first read-back to the first trusted answer; None without one."""
+    retries: int = 0
+    """Read-backs that went out before the first trusted answer, beyond the first: the device
+    was slow to apply or to answer, the first sign of a transport with no airtime to spare."""
+    confirmed: bool = False
+    """A second read-back agreed with the answer."""
+    moved: bool = False
+    """Two read-backs in a row disagreed: the device was still changing colour. With ``xy``
+    it settled afterwards; without, it never did within the sample."""
+    unapplied: bool = False
+    """Every answered read-back showed the colour from before the command and nothing else
+    came: the device did not apply the command (it keeps its colour while off, or ignores
+    the command)."""
 
 
 def take_sample(
@@ -128,28 +167,30 @@ def take_sample(
     """Command one colour and collect the device's answer under the timing rules. An
     untrusted value equal to ``previous`` (the last sample's answer) is the device's late
     report of the colour it showed before, not an answer to this command: it is set aside
-    so the read-back still goes out. A trusted answer (a read-back) ends the sample at once;
-    a spontaneous report is kept only until the settle window closes without one. With
-    ``interrupt`` the sample also ends the moment the fixture is lit or the room occupied,
-    so the driver can restore at once; the forced mode passes False, since a lit fixture
-    says so in every message."""
+    so the read-back still goes out. A trusted answer (a read-back) is confirmed by a second
+    read-back sent at once: two that agree end the sample; two that disagree mean the device
+    is still changing, and it is read again after ``READ_RETRY`` until two agree or the
+    sample runs out with no answer. A read-back that still shows the colour from before the
+    command is ``unapplied``; the driver reads again, and a sample answered that way alone
+    says the device did not apply the command. A spontaneous report is kept only until the
+    settle window closes without a trusted answer. With ``interrupt`` the sample also ends
+    the moment the fixture is lit or the room occupied, so the driver can restore at once;
+    the forced mode passes False, since a lit fixture says so in every message."""
     channel.command(xy)
     start = clock.monotonic()
     end = start + ANSWER_TIMEOUT
-    first: float | None = None
-    last: XY | None = None
-    trusted = False
-    echo = False
-    foreign = False
-    lit = False
-    occupied = False
-    reads = 0
+    first: float | None = None  # when a spontaneous report opened the settle window
+    last: XY | None = None  # the spontaneous value on hand
+    candidate: XY | None = None  # the latest trusted answer, awaiting a second that agrees
+    settled: XY | None = None
+    echo = foreign = lit = occupied = moved = False
+    reads = answered = unapplied = retries = 0
     first_read: float | None = None
     answered_at: float | None = None
     next_read = start + READ_AFTER
-    while clock.monotonic() < end and not trusted:
+    while clock.monotonic() < end and settled is None:
         now = clock.monotonic()
-        if reads < MAX_READS and now >= next_read:
+        if now >= next_read and reads < MAX_SETTLE_READS and reads - answered < MAX_READS:
             channel.read()
             reads += 1
             if first_read is None:
@@ -162,14 +203,27 @@ def take_sample(
                 lit = True
             elif ob.kind == "occupied":
                 occupied = True
+            elif ob.kind == "unapplied":
+                answered += 1
+                unapplied += 1
             elif ob.kind == "echo" or ob.xy is None or (not ob.trusted and is_echo(xy, ob.xy)):
                 echo = True
             elif not ob.trusted and previous is not None and is_echo(previous, ob.xy):
                 continue  # stale: the previous colour reported late
             elif ob.trusted:
-                last, trusted = ob.xy, True
-                answered_at = clock.monotonic()
-            elif not trusted:
+                answered += 1
+                if candidate is None:
+                    answered_at = clock.monotonic()
+                    retries = max(0, reads - 1)
+                    candidate = ob.xy
+                    next_read = clock.monotonic()  # confirm at once
+                elif is_echo(candidate, ob.xy):
+                    settled = ob.xy
+                else:
+                    moved = True
+                    candidate = ob.xy
+                    next_read = clock.monotonic() + READ_RETRY
+            elif candidate is None:
                 if first is None:
                     first = clock.monotonic()
                     end = min(end, first + SETTLE)
@@ -177,9 +231,27 @@ def take_sample(
         if interrupt and (lit or occupied):
             break
     latency = None
-    if trusted and first_read is not None and answered_at is not None:
+    if first_read is not None and answered_at is not None:
         latency = max(0.0, answered_at - first_read)
-    return Sample(last, echo and last is None, foreign, lit, trusted, occupied, reads, latency)
+    if candidate is None:
+        retries = max(0, reads - 1)
+    if settled is not None:
+        return Sample(
+            settled, False, foreign, lit, True, occupied, reads, latency, retries, True, moved
+        )
+    if candidate is not None and not moved:
+        # one trusted answer, and the confirming read-back went unanswered
+        return Sample(candidate, False, foreign, lit, True, occupied, reads, latency, retries)
+    if candidate is not None:
+        # the device was still changing colour when the sample ran out: no answer
+        return Sample(
+            None, False, foreign, lit, False, occupied, reads, latency, retries, False, True
+        )
+    if last is not None:
+        return Sample(last, False, foreign, lit, False, occupied, reads, None, retries)
+    return Sample(
+        None, echo, foreign, lit, False, occupied, reads, None, retries, unapplied=unapplied > 0
+    )
 
 
 def measure(
@@ -199,13 +271,29 @@ def measure(
     fixture at once with no transition and withholding the polygon, on the first sign that
     it would not be: the room becoming occupied (``occupied``, ahead of the render that
     follows presence), a command that turns the fixture on or the fixture reporting itself on
-    (``lit``), or ``abort_when`` returning a reason between samples."""
+    (``lit``), or ``abort_when`` returning a reason between samples.
+
+    A device that answers nothing usable on its opening samples is diagnosed rather than
+    driven through the whole protocol (``DIAGNOSE_AFTER`` samples of one kind before any
+    answer): one that keeps its resting colour under every command does not apply colour
+    while off, and in the forced mode the driver switches it on and starts over (``restore``
+    turns it off again); one that answers no read-back is not reachable this way; one still
+    changing colour when every sample runs out ramps too slowly. Each reason is the verdict's
+    ``aborted`` (see the ``NOT_APPLIED_WHILE_OFF``, ``NOT_APPLIED_LIT``, ``NO_READ_ANSWER``
+    and ``NEVER_SETTLES`` prefixes)."""
     clk = clock or SystemClock()
     pr = probe or Probe()
-    if not allow_lit and (channel.needs_lit or channel.is_lit()):
+    # asked in every mode: the channel's snapshot is what restore puts back and what a
+    # read-back that shows the colour from before the command is recognised against
+    lit = channel.is_lit()
+    if not allow_lit and (channel.needs_lit or lit):
         return None
     aborted: str | None = None
     previous: XY | None = None
+    answered_any = False
+    opening = {"unapplied": 0, "silent": 0, "unsettled": 0}
+    lit_up = False
+    unconfirmed = ramped = unsettled = 0
     try:
         while (step := pr.next()) is not None:
             if abort_when is not None and (aborted := abort_when()) is not None:
@@ -227,6 +315,26 @@ def measure(
                     else "fixture turned on during the measurement"
                 )
                 break
+            if sample.xy is not None:
+                answered_any = True
+                if sample.trusted and not sample.confirmed:
+                    unconfirmed += 1
+                if sample.moved:
+                    ramped += 1
+            elif sample.moved:
+                unsettled += 1
+            diagnosis = None if answered_any or sample.foreign else _diagnose(sample, opening)
+            if diagnosis == "unapplied" and not lit_up and allow_lit and channel.light_up():
+                # measured lit instead, from the start; restore turns it off again
+                lit_up = True
+                opening = dict.fromkeys(opening, 0)
+                pr.reset()
+                previous = None
+                _wait(channel, clk, RETAKE_PAUSE)
+                continue
+            if diagnosis is not None:
+                aborted = _reason(diagnosis, lit_up=lit_up, allow_lit=allow_lit)
+                break
             pr.answer(step, sample.xy, trusted=sample.trusted)
             if sample.xy is not None:
                 previous = sample.xy
@@ -234,16 +342,74 @@ def measure(
     finally:
         channel.restore(0.0 if aborted is not None else 0.2)
     verdict = pr.verdict()
+    notes = list(verdict.notes)
+    if lit_up:
+        notes.append("switched on for the measurement: the device keeps its colour while off")
+    if unconfirmed:
+        notes.append(
+            f"{unconfirmed} answer(s) from a single read-back (the confirming read-back went "
+            f"unanswered)"
+        )
+    if ramped:
+        notes.append(
+            f"{ramped} sample(s) settled only after the device was seen still changing "
+            f"colour: it ramps on its own"
+        )
+    if unsettled:
+        notes.append(
+            f"{unsettled} sample(s) without an answer: the device was still changing colour "
+            f"when the sample ran out"
+        )
     if aborted is None:
-        return verdict
+        return replace(verdict, notes=tuple(notes))
     return replace(
         verdict,
         polygon=None,
         model_error=None,
         fits=(),
-        notes=(*verdict.notes, f"aborted: {aborted}"),
+        notes=(*notes, f"aborted: {aborted}"),
         aborted=aborted,
     )
+
+
+def _diagnose(sample: Sample, opening: dict[str, int]) -> str | None:
+    """Count what an unanswered opening sample was, and name the kind that has recurred
+    ``DIAGNOSE_AFTER`` times. None while nothing has."""
+    if sample.xy is not None:
+        return None
+    if sample.unapplied:
+        kind = "unapplied"
+    elif sample.moved:
+        kind = "unsettled"
+    else:
+        kind = "silent"
+    opening[kind] += 1
+    return kind if opening[kind] >= DIAGNOSE_AFTER else None
+
+
+def _reason(kind: str, *, lit_up: bool, allow_lit: bool) -> str:
+    n = DIAGNOSE_AFTER
+    if kind == "unapplied" and lit_up:
+        return (
+            f"{NOT_APPLIED_LIT}: it kept its resting colour through {n} commands after being "
+            f"switched on; the device does not take an xy colour this way"
+        )
+    if kind == "unapplied":
+        how = (
+            "this transport cannot switch it on"
+            if allow_lit
+            else "the forced mode switches it on to measure it"
+        )
+        return (
+            f"{NOT_APPLIED_WHILE_OFF}: it kept its resting colour through the first {n} "
+            f"commands; {how}"
+        )
+    if kind == "unsettled":
+        return (
+            f"{NEVER_SETTLES}: the device was still changing colour {ANSWER_TIMEOUT:g} s after "
+            f"each of the first {n} commands; its own ramp is too slow to measure"
+        )
+    return f"{NO_READ_ANSWER} through the first {n} commands: the device is not reachable this way"
 
 
 def _wait(channel: DeviceChannel, clock: Clock, seconds: float) -> None:

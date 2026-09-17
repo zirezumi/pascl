@@ -11,7 +11,12 @@ from pascl.clock import ManualClock
 from pascl.core.gamut import XY, Polygon, project
 from pascl.shell.gamut_measure import (
     ANSWER_TIMEOUT,
+    DIAGNOSE_AFTER,
     MAX_READS,
+    NEVER_SETTLES,
+    NO_READ_ANSWER,
+    NOT_APPLIED_LIT,
+    NOT_APPLIED_WHILE_OFF,
     READ_AFTER,
     Observation,
     gamut_from,
@@ -61,6 +66,8 @@ class FakeDevice:
         self.commands = 0
         self.reads = 0
         self.restored = False
+        self.lit_up = 0
+        self.current: XY = (0.4, 0.4)
 
     def is_lit(self) -> bool | None:
         return self.lit
@@ -84,6 +91,11 @@ class FakeDevice:
         self.pending.append(
             (self.clock.monotonic() + 0.05, Observation("device", self.current, trusted=True))
         )
+
+    def light_up(self) -> bool:
+        self.lit_up += 1
+        self.lit = True
+        return True
 
     def observe(self, seconds: float) -> list[Observation]:
         self.clock.advance(seconds)
@@ -109,7 +121,10 @@ def test_measure_recovers_the_polygon_by_reading_back() -> None:
     for hidden in TRIANGLE:
         assert min(abs(hidden[0] - h[0]) + abs(hidden[1] - h[1]) for h in v.polygon) < 1e-5
     assert v.unanswered == 0
-    assert dev.reads == dev.commands  # never answered before the read, so every sample read
+    # never answered before the read, so every sample read, and every answer was confirmed
+    # by a second read that agreed; a device that applies at once is never switched on
+    assert dev.reads == 2 * dev.commands and dev.lit_up == 0
+    assert not any("read-back" in n or "changing" in n for n in v.notes)
     assert dev.restored
     g = gamut_from(v, dev, clock)
     assert g is not None and g.bound_to == "fake-device-1" and g.measured is not None
@@ -124,9 +139,10 @@ def test_the_read_back_ends_the_sample_and_a_spontaneous_report_is_a_fallback() 
     t0 = clock.monotonic()
     v = measure(dev, clock=clock)
     assert v is not None and v.polygon is not None and len(v.polygon) == 3
-    # every sample read back (the report came at the same instant and did not replace it),
-    # and a fixture takes well under a minute: the exposed window per sample is the read delay
-    assert dev.reads == dev.commands
+    # every sample read back and confirmed (the report came at the same instant and did not
+    # replace it), and a fixture takes well under a minute: the exposed window per sample is
+    # the read delay plus one round trip
+    assert dev.reads == 2 * dev.commands
     assert clock.monotonic() - t0 < 24 * (READ_AFTER + 0.5)
 
     class ReadsUnanswered(FakeDevice):
@@ -165,7 +181,7 @@ def test_fixture_turning_on_aborts_and_withholds_the_polygon() -> None:
     dev2 = FakeDevice(clock, TRIANGLE, lit=True, lit_at=5)
     v2 = measure(dev2, allow_lit=True, clock=clock)
     assert v2 is not None and v2.polygon is not None and v2.aborted is None
-    assert v2.unanswered == 0 and dev2.reads == dev2.commands
+    assert v2.unanswered == 0 and dev2.reads == 2 * dev2.commands
 
     class AlwaysLit(FakeDevice):
         def command(self, xy: XY) -> None:
@@ -219,9 +235,142 @@ def test_take_sample_times_out_on_a_silent_device() -> None:
     dev = Silent(clock, TRIANGLE)
     t0 = clock.monotonic()
     s = take_sample(dev, (0.95, 0.04), clock)
-    assert s.xy is None and s.echo_only and not s.foreign
+    assert s.xy is None and s.echo_only and not s.foreign and not s.unapplied
     assert dev.reads == MAX_READS
     assert READ_AFTER <= clock.monotonic() - t0 <= ANSWER_TIMEOUT + 0.3
+    # a whole measurement does not endure it: two silent samples and it stops, with the reason
+    dev2 = Silent(clock, TRIANGLE)
+    v = measure(dev2, clock=clock)
+    assert v is not None and v.polygon is None and v.aborted is not None
+    assert v.aborted.startswith(NO_READ_ANSWER) and dev2.commands == DIAGNOSE_AFTER
+    assert dev2.restored
+
+
+class Ramps(FakeDevice):
+    """A device with a ramp of its own: it slides from the colour it showed to the clipped
+    target over ``ramp_s`` seconds whatever transition was commanded, and a read answers
+    wherever it is at that moment."""
+
+    def __init__(self, clock: ManualClock, poly: Polygon, *, ramp_s: float) -> None:
+        super().__init__(clock, poly)
+        self.ramp_s = ramp_s
+        self.origin: XY = self.current
+        self.target: XY = self.current
+        self.t0 = clock.monotonic()
+
+    def command(self, xy: XY) -> None:
+        self.origin = self.at(self.clock.monotonic())
+        super().command(xy)
+        self.target = self.current
+        self.t0 = self.clock.monotonic()
+
+    def at(self, now: float) -> XY:
+        f = min(1.0, (now - self.t0) / self.ramp_s)
+        return (
+            self.origin[0] + f * (self.target[0] - self.origin[0]),
+            self.origin[1] + f * (self.target[1] - self.origin[1]),
+        )
+
+    def read(self) -> None:
+        self.reads += 1
+        now = self.clock.monotonic()
+        self.pending.append((now + 0.05, Observation("device", self.at(now), trusted=True)))
+
+
+def test_a_device_with_its_own_ramp_is_read_until_it_settles() -> None:
+    """The first read lands part-way along the ramp and the confirming read disagrees; the
+    driver keeps reading until two agree, and the answer is where the device settled, so the
+    polygon is exact. A single read would have taken the part-way value for the device's
+    clip."""
+    clock = _clock()
+    dev = Ramps(clock, TRIANGLE, ramp_s=1.0)
+    s = take_sample(dev, (0.95, 0.04), clock)
+    assert s.trusted and s.confirmed and s.moved and s.xy is not None
+    assert abs(s.xy[0] - TRIANGLE[1][0]) < 1e-6 and abs(s.xy[1] - TRIANGLE[1][1]) < 1e-6
+    assert 3 <= dev.reads <= 7
+    dev2 = Ramps(clock, TRIANGLE, ramp_s=1.0)
+    v = measure(dev2, clock=clock)
+    assert v is not None and v.polygon is not None and v.aborted is None
+    for hidden in TRIANGLE:
+        assert min(abs(hidden[0] - h[0]) + abs(hidden[1] - h[1]) for h in v.polygon) < 1e-5
+    assert v.model_error is not None and v.model_error < 1e-4
+    assert any("ramps on its own" in n for n in v.notes)
+
+
+def test_a_device_that_never_settles_is_diagnosed() -> None:
+    clock = _clock()
+    dev = Ramps(clock, TRIANGLE, ramp_s=5.0)  # longer than a sample
+    s = take_sample(dev, (0.95, 0.04), clock)
+    assert s.xy is None and s.moved and not s.trusted and not s.unapplied
+    dev2 = Ramps(clock, TRIANGLE, ramp_s=5.0)
+    v = measure(dev2, clock=clock)
+    assert v is not None and v.polygon is None and v.aborted is not None
+    assert v.aborted.startswith(NEVER_SETTLES) and dev2.commands == DIAGNOSE_AFTER
+
+
+class KeepsColourWhileOff(FakeDevice):
+    """A device that ignores a colour command while it is off (no execute-if-off), the way
+    many non-Hue bulbs do; a read then answers the colour it kept."""
+
+    def command(self, xy: XY) -> None:
+        before = self.current
+        super().command(xy)
+        self.applied = self.lit
+        if not self.applied:
+            self.current = before
+
+    def read(self) -> None:
+        self.reads += 1
+        kind = "device" if self.applied else "unapplied"
+        self.pending.append(
+            (self.clock.monotonic() + 0.05, Observation(kind, self.current, trusted=self.applied))
+        )
+
+
+def test_a_device_that_keeps_its_colour_while_off_is_diagnosed_then_measured_lit() -> None:
+    clock = _clock()
+    dev = KeepsColourWhileOff(clock, TRIANGLE)
+    s = take_sample(dev, (0.95, 0.04), clock)
+    assert s.xy is None and s.unapplied and s.echo_only and not s.trusted
+    # invisible mode: two samples answered with the resting colour, and it stops, saying why
+    dev = KeepsColourWhileOff(clock, TRIANGLE)
+    v = measure(dev, clock=clock)
+    assert v is not None and v.polygon is None and v.aborted is not None
+    assert v.aborted.startswith(NOT_APPLIED_WHILE_OFF) and "forced mode" in v.aborted
+    assert dev.commands == DIAGNOSE_AFTER and dev.lit_up == 0 and dev.restored
+    # forced mode: the same diagnosis switches it on and the measurement starts over, lit
+    dev = KeepsColourWhileOff(clock, TRIANGLE)
+    v = measure(dev, allow_lit=True, clock=clock)
+    assert v is not None and v.polygon is not None and v.aborted is None
+    for hidden in TRIANGLE:
+        assert min(abs(hidden[0] - h[0]) + abs(hidden[1] - h[1]) for h in v.polygon) < 1e-5
+    assert dev.lit_up == 1 and dev.commands == DIAGNOSE_AFTER + 24 and v.unanswered == 0
+    assert any("switched on for the measurement" in n for n in v.notes)
+    assert dev.restored
+
+    class NeverTakesColour(KeepsColourWhileOff):
+        def light_up(self) -> bool:
+            self.lit_up += 1
+            return True  # on, but colour is still ignored
+
+        def command(self, xy: XY) -> None:
+            super().command(xy)
+            self.applied = False
+
+    dev2 = NeverTakesColour(clock, TRIANGLE)
+    v2 = measure(dev2, allow_lit=True, clock=clock)
+    assert v2 is not None and v2.polygon is None and v2.aborted is not None
+    assert v2.aborted.startswith(NOT_APPLIED_LIT) and dev2.lit_up == 1
+    assert dev2.commands == 2 * DIAGNOSE_AFTER
+
+    class CannotLight(KeepsColourWhileOff):
+        def light_up(self) -> bool:
+            return False
+
+    dev3 = CannotLight(clock, TRIANGLE)
+    v3 = measure(dev3, allow_lit=True, clock=clock)
+    assert v3 is not None and v3.aborted is not None
+    assert v3.aborted.startswith(NOT_APPLIED_WHILE_OFF) and "cannot switch it on" in v3.aborted
 
 
 # ---------------------------------------------------------------------------------------------
@@ -304,8 +453,8 @@ def test_resting_colour_reported_late_is_not_an_answer() -> None:
 
 def test_a_read_that_lands_before_the_command_applied_is_read_again() -> None:
     """The read-back answers with the colour the device showed before the command: it has
-    not applied it yet. The channel passes nothing on, the driver reads again, and the second
-    read's answer is the trusted one."""
+    not applied it yet. The channel passes that on as ``unapplied``, the driver reads again,
+    and the second read's answer is the trusted one."""
     link = FakeLink()
     ch = Z2MDeviceChannel(link, "z2m-3/bulb/set")
     link.deliver("z2m-3/bulb", {"state": "OFF", "color": {"x": 0.4726, "y": 0.413}})
@@ -315,7 +464,8 @@ def test_a_read_that_lands_before_the_command_applied_is_read_again() -> None:
     assert [o.kind for o in ch.observe(0.1)] == ["echo"]
     ch.read()
     link.deliver("z2m-3/bulb", {"color": {"x": 0.4726, "y": 0.413}, "state": "OFF"})  # too early
-    assert ch.observe(0.1) == []
+    obs = ch.observe(0.1)
+    assert [(o.kind, o.xy, o.trusted) for o in obs] == [("unapplied", (0.4726, 0.413), False)]
     ch.read()
     link.deliver("z2m-3/bulb", {"color": {"x": 0.6915, "y": 0.3083}, "state": "OFF"})
     assert [(o.kind, o.trusted) for o in ch.observe(0.1)] == [("device", True)]
@@ -335,7 +485,9 @@ def test_a_read_that_lands_before_the_command_applied_is_read_again() -> None:
 
     dev = SlowToApply(clock, TRIANGLE)
     s = take_sample(dev, (0.95, 0.04), clock)
-    assert s.trusted and s.xy is not None and dev.reads == 2
+    # the dropped read, the answer, the confirming read: one retry, then confirmed
+    assert s.trusted and s.xy is not None and s.confirmed and dev.reads == 3
+    assert s.retries == 1 and not s.moved and not s.unapplied
 
 
 def test_state_on_is_reported_as_lit() -> None:
@@ -522,6 +674,32 @@ def test_snapshot_is_lit_and_restore() -> None:
     assert ch2.is_lit() is False
     ch2.restore()
     assert link2.published[-1] == (
+        "z2m-4/strip/set",
+        '{"color": {"x": 0.434, "y": 0.383}, "transition": 0.2}',
+    )
+
+
+def test_light_up_switches_on_and_restore_puts_the_colour_back_before_switching_off() -> None:
+    """A device measured lit is one that keeps its colour while off: the colour goes back
+    first, while it is on, or it would come back on later showing the last probe."""
+    link = FakeLink()
+    ch = Z2MDeviceChannel(link, "z2m-4/strip/set")
+    link.deliver(
+        "z2m-4/strip", {"state": "OFF", "color_mode": "xy", "color": {"x": 0.434, "y": 0.383}}
+    )
+    assert ch.is_lit() is False
+    assert ch.light_up() is True
+    assert link.published[-1] == ("z2m-4/strip/set", '{"state": "ON", "transition": 0}')
+    ch.command((0.95, 0.04))
+    link.deliver("z2m-4/strip", {"state": "ON", "color": {"x": 0.95, "y": 0.04}})  # the echo, lit
+    assert [o.kind for o in ch.observe(0.1)] == ["lit", "echo"]
+    ch.restore(0.0)
+    assert link.published[-2:] == [
+        ("z2m-4/strip/set", '{"color": {"x": 0.434, "y": 0.383}, "transition": 0.0}'),
+        ("z2m-4/strip/set", '{"state": "OFF", "transition": 0.0}'),
+    ]
+    ch.restore()  # switched off once; a later restore is the colour alone
+    assert link.published[-1] == (
         "z2m-4/strip/set",
         '{"color": {"x": 0.434, "y": 0.383}, "transition": 0.2}',
     )
