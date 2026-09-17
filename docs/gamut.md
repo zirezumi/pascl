@@ -284,8 +284,12 @@ mix). inherit lets a measured value seed the unmeasured units of the same model 
 source, and refuses a label whose units disagree; it never seeds a fixture that was commanded and
 reported nothing, because that fixture's own evidence says it does not report.
 
-With the interval known, the settling report is predictable from the fixture's last report:
-max(fade end, last report + R_f). What lands beyond that prediction is the host's delivery
+With the interval known, the settling report is predictable from the fixture's last report: the
+first report slot (last report + k * R_f, k >= 1) at or after the fade's end. One slot ahead is
+not enough in general: a comparator with a fixed delay trips a whole slot before the end of a
+long transition, and the slot after that is the settling one (on the reference installation a
+one-slot prediction armed 0.9 s before the bulbs' settling slot at a 40 s transition, sixteen
+no-op frames in four ticks, none mid-fade). What lands beyond that prediction is the host's delivery
 jitter, not the device's, and jitter takes a high quantile of it home-wide over the trips a
 fixed-delay comparator would have lost (declined below MIN_TRIPS). replay says what arming at
 prediction plus jitter would have done on those trips: how many still arm early, how long the

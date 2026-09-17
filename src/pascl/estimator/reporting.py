@@ -8,8 +8,9 @@ on/off reporting only, and the colour cadence is the bulb firmware's own), so it
 the fixture's own colour reports while a transition is in flight arrive at a steady interval,
 and the median of those inter-report gaps is the fixture's report interval, R_f.
 
-Given R_f and the time of the fixture's last report, the next report is predictable:
-``max(fade end, last report + R_f)``. What the settling report lands beyond that prediction
+Given R_f and the time of the fixture's last report, the settling report is predictable: the
+first report slot (last report plus whole multiples of R_f) at or after the fade's end. What
+the settling report lands beyond that prediction
 is not a device property but the host's delivery jitter, J, derived home-wide as a high
 quantile of the residual over every trip the comparator would otherwise have lost. The two
 together give a consumer its arm: wait until the prediction plus J, unless the device
@@ -28,6 +29,7 @@ confirm or, loudly, contradict it.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -261,11 +263,18 @@ def labels_of(model: HomeModel) -> dict[str, str | None]:
 
 
 def predict(trip: Trip, interval: float | None) -> float:
-    """When the settling report is due: the fade's end, or the fixture's next report if
-    that is later. An unknown interval predicts the fade end alone."""
-    if interval is None:
+    """When the settling report is due: the fixture's first report slot at or after the
+    fade's end. A moving device reports every ``interval``, so its slots are the last report
+    plus whole intervals, and the settling report is the first slot the fade end does not
+    reach past; a trip a whole slot before the fade end (a long transition, the sensor's fixed
+    delay) must look two slots ahead, not one. A fade that ended before the last report is
+    due one interval on. An unknown interval predicts the fade end alone."""
+    if interval is None or interval <= 0:
         return trip.fade_end_s
-    return max(trip.fade_end_s, trip.last_report_s + interval)
+    if trip.fade_end_s <= trip.last_report_s:
+        return trip.last_report_s + interval
+    slots = math.ceil((trip.fade_end_s - trip.last_report_s) / interval)
+    return trip.last_report_s + slots * interval
 
 
 def residuals(trips: Iterable[Trip], intervals: Mapping[str, ReportInterval]) -> list[float]:

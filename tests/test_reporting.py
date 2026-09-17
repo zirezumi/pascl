@@ -121,12 +121,24 @@ def test_inherit_keeps_a_declined_fixtures_reason_when_nothing_seeds_it() -> Non
     assert got["lonely"].note is not None and got["lonely"].note.startswith("too few gaps")
 
 
-def test_prediction_is_fade_end_or_next_report_whichever_is_later() -> None:
+def test_prediction_is_the_first_report_slot_at_or_after_the_fade_end() -> None:
     t = Trip("a", fade_end_s=30.0, tripped_s=31.0, last_report_s=21.5, settled_s=31.6)
     assert predict(t, 10.04) == pytest.approx(31.54)
     assert predict(t, None) == 30.0
-    early = Trip("a", 30.0, 31.0, 15.0, 30.4)
-    assert predict(early, 10.04) == 30.0
+    # the fade ended before the last report: the next slot is one interval on
+    late = Trip("a", 30.0, 31.0, 30.4, 40.5)
+    assert predict(late, 10.04) == pytest.approx(40.44)
+    # a slot lands exactly on the fade end: that slot reports the settled colour
+    exact = Trip("a", 30.0, 31.0, 19.96, 30.0)
+    assert predict(exact, 10.04) == pytest.approx(30.0)
+    # a 40 s transition with the sensor tripping at 31 s: the last report was one slot
+    # before the fade end, so the settling report is TWO slots on (measured 2026-09-17: a
+    # one-slot prediction armed at 42.0 s, the bulb's settling slot was 42.9 s, sixteen
+    # no-op repaints in four ticks)
+    long = Trip("a", fade_end_s=41.5, tripped_s=32.0, last_report_s=22.14, settled_s=42.88)
+    assert predict(long, 10.36) == pytest.approx(42.86)
+    assert predict(long, 10.36) < long.settled_s + 1.0
+    assert predict(long, None) == 41.5
 
 
 def trips() -> list[Trip]:
