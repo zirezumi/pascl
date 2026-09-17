@@ -263,3 +263,39 @@ instead: static entries per family (bulbs, strips) and, for the solar white pale
 worst excursion along each calibration's warm-to-cool and warm-to-night arc. Fixtures that
 share a polygon and rule are reported together. Nothing at runtime depends on it (the
 comparators are exact about reachability); it makes the author's choice visible.
+
+## 9. When to judge: the report cadence (pascl.estimator.reporting)
+
+A comparator that judges a fixture against its commanded colour has a second question after
+WHERE the device can land: WHEN it has landed. A command with a transition keeps the device
+moving for that long, and the device says where it is only at its own report cadence, so a
+comparator armed at a fixed delay races the last report and wins some of the time, re-sending
+the colour the fade has just reached (on the reference installation, one 30 s crossfade in ten,
+about 180 no-op frames a day, and a visible snap mid-fade at any transition longer than the arm).
+
+The cadence is not declared: Zigbee2MQTT configures level and on/off reporting on those bulbs and
+nothing for colour, and the ~10 s colour interval is the firmware's own. So it is observed, in
+the same spirit as the polygon. estimate takes fades (a transition and the times the fixture
+reported a NEW colour after the command) and returns each fixture's report interval as the median
+gap between consecutive reports inside the fade, with the gaps it rests on and the fraction on
+cadence. It declines rather than guesses: too few gaps, no colour reports at all (a device whose
+transport only ever echoes the command), or gaps that describe no single interval (a 5 / 10 / 20 s
+mix). inherit lets a measured value seed the unmeasured units of the same model label, naming the
+source, and refuses a label whose units disagree; it never seeds a fixture that was commanded and
+reported nothing, because that fixture's own evidence says it does not report.
+
+With the interval known, the settling report is predictable from the fixture's last report:
+max(fade end, last report + R_f). What lands beyond that prediction is the host's delivery
+jitter, not the device's, and jitter takes a high quantile of it home-wide over the trips a
+fixed-delay comparator would have lost (declined below MIN_TRIPS). replay says what arming at
+prediction plus jitter would have done on those trips: how many still arm early, how long the
+consumer waits, when a genuinely stuck fixture is acted on. stands_down names the regime where
+the arm is longer than the interval at which the fixture is re-commanded, so the comparator can
+only ever interrupt a fade there and should say so per fixture rather than fall silent.
+
+The failure direction is the design: an unknown interval or jitter contributes nothing, so a
+consumer arms at the fade end as before (no-op frames at worst, never late for a stuck device),
+and a value can only ever move the arm later. On the reference installation the two-evening
+derivation measured 10.04 s on every Hue strip, spot and BR30 and 10.37 s on the A19/A21 bulbs,
+a jitter of 3.9 s at the 99th percentile, and zero to two false arms in 223 trips where the fixed
+delay had lost all of them.
