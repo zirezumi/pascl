@@ -12,7 +12,7 @@ from pascl.core.gamut import XY, Polygon, project
 from pascl.shell.gamut_measure import (
     ANSWER_TIMEOUT,
     CT_DECLINED,
-    CT_STORED_WHILE_OFF,
+    CT_STORED_UNCLIPPED,
     DIAGNOSE_AFTER,
     MAX_READS,
     NEVER_SETTLES,
@@ -58,6 +58,7 @@ class FakeDevice:
         foreign_at: int | None = None,
         lit_at: int | None = None,
         ct_range: tuple[int, int] | None = (153, 500),
+        ct_limits: tuple[int, int] | None = (153, 500),
     ) -> None:
         self.clock = clock
         self.poly = poly
@@ -72,11 +73,14 @@ class FakeDevice:
         self.restored = False
         self.lit_up = 0
         self.current: XY = (0.4, 0.4)
-        # the hidden colour-temperature range, mireds (coolest, warmest); None: no such thing,
-        # a colour temperature is ignored and a read answers the resting value
+        # the hidden colour-temperature range the attribute clips to, mireds (coolest,
+        # warmest); None: the attribute stores what it is sent (a Hue). And what the device
+        # DECLARES as its limits; None: it does not answer that read.
         self.ct_range = ct_range
+        self.ct_limits = ct_limits
         self.current_ct = 370
         self.ct_in_flight = False
+        self.limit_reads = 0
 
     def is_lit(self) -> bool | None:
         return self.lit
@@ -87,6 +91,18 @@ class FakeDevice:
         self.pending.append((self.clock.monotonic() + 0.05, Observation("echo")))
         if self.ct_range is not None:
             self.current_ct = min(max(mired, self.ct_range[0]), self.ct_range[1])
+        else:
+            self.current_ct = mired
+
+    def read_ct_limits(self) -> None:
+        self.limit_reads += 1
+        if self.ct_limits is not None:
+            self.pending.append(
+                (
+                    self.clock.monotonic() + 0.05,
+                    Observation("device", trusted=True, ct_limits=self.ct_limits),
+                )
+            )
 
     def command(self, xy: XY) -> None:
         self.commands += 1
@@ -157,72 +173,66 @@ def test_measure_recovers_the_polygon_by_reading_back() -> None:
 
 def test_the_colour_temperature_range_has_its_own_switches_and_declines_honestly() -> None:
     clock = _clock()
-    # a material without cct: no probe goes out and no range is recorded
+    # a material without cct: no limits read, no probe, no range
     dev = FakeDevice(clock, TRIANGLE)
     v = measure(dev, clock=clock, ct=False)
     assert v is not None and v.polygon is not None
-    assert dev.ct_commands == 0 and v.ct_range_k is None and v.ct_answers == ()
+    assert dev.ct_commands == 0 and dev.limit_reads == 0 and v.ct_range_k is None
     # the range alone, for a fixture whose polygon is already known: no colour probe
     dev = FakeDevice(clock, TRIANGLE)
     v = measure(dev, clock=clock, xy=False)
     assert v is not None and v.polygon is None and v.aborted is None
-    assert dev.commands == 0 and dev.ct_commands == 2 and v.ct_range_k == (2000, 6535)
+    assert dev.commands == 0 and dev.ct_commands == 2 and dev.limit_reads == 1
+    assert v.ct_range_k == (2000, 6535) and v.ct_limits == (153, 500)
     assert dev.restored and gamut_from(v, dev, clock) is None
-    # a device that ignores a colour temperature answers its resting value to both probes:
-    # not a range, declined with the evidence in the notes
-    dev = FakeDevice(clock, TRIANGLE, ct_range=None)
+    # a device that ignores a colour temperature answers its resting value to both probes and
+    # declares nothing: declined with the evidence
+    dev = FakeDevice(clock, TRIANGLE, ct_range=None, ct_limits=None)
+    dev.command_ct = lambda mired: FakeDevice.command_ct(dev, dev.current_ct)  # type: ignore[method-assign]
     v = measure(dev, clock=clock)
     assert v is not None and v.polygon is not None and v.ct_range_k is None
-    assert v.ct_answers == ((50, 370), (1000, 370))
-    assert any("range declined" in n and "50->370" in n for n in v.notes)
-    # a device that takes anything it is sent (or a transport echoing the command as the
-    # device's answer) claims 1000-20000 K: not a physical limit, declined
-    dev = FakeDevice(clock, TRIANGLE, ct_range=(1, 100000))
-    v = measure(dev, clock=clock)
-    assert v is not None and v.ct_range_k is None and v.ct_answers == ((50, 50), (1000, 1000))
+    assert v.ct_answers == ((50, 370), (1000, 370)) and v.ct_limits is None
+    assert any(n.startswith(CT_DECLINED) and "no limits" in n for n in v.notes)
     # the range probes never run after an aborted polygon measurement
     dev = FakeDevice(clock, TRIANGLE, lit_at=3)
     v = measure(dev, clock=clock)
-    assert v is not None and v.aborted is not None and dev.ct_commands == 0
+    assert v is not None and v.aborted is not None and dev.ct_commands == 0 and dev.limit_reads == 0
 
 
-class StoresCtWhileOff(FakeDevice):
-    """A Hue bulb: an xy is clipped to the gamut whether lit or not, but a colour temperature
-    is stored UNCLIPPED while off and clipped only while the emitter is lit. The reference
-    installation's 22 placeholder-range bulbs answered 50 and 1000 to the two probes while
-    off, and 501 to a lit 678."""
-
-    def command_ct(self, mired: int) -> None:
-        super().command_ct(mired)
-        if not self.lit:
-            self.current_ct = mired
-
-
-def test_a_bulb_that_stores_a_colour_temperature_unclipped_while_off_is_measured_lit() -> None:
+def test_a_hue_bulb_stores_the_command_unclipped_and_its_declared_limits_decide() -> None:
+    """Every Hue on the reference installation answers a probe with the probe's own value (the
+    attribute is not clipped, lit or dark); 63 declare 153-500 mired and get that range, 22
+    declare 50-1000 mired (the attribute's whole span) and are declined by name."""
     clock = _clock()
-    # invisible mode: both probes come back as sent, which is no range; declined by name
-    dev = StoresCtWhileOff(clock, TRIANGLE)
+    dev = FakeDevice(clock, TRIANGLE, ct_range=None, ct_limits=(153, 500))
     v = measure(dev, clock=clock)
-    assert v is not None and v.polygon is not None and v.ct_range_k is None
-    assert v.ct_answers == ((50, 50), (1000, 1000)) and dev.lit_up == 0
-    assert any(n.startswith(CT_DECLINED) and CT_STORED_WHILE_OFF in n for n in v.notes)
-    # forced mode: the first probe's own value switches the bulb on and both probes are
-    # retaken lit; the polygon stage never lit it (it clips xy while off), the range stage did
-    dev = StoresCtWhileOff(clock, TRIANGLE)
+    assert v is not None and v.polygon is not None
+    assert v.ct_answers == ((50, 50), (1000, 1000)) and v.ct_limits == (153, 500)
+    assert v.ct_range_k == (2000, 6535)
+    assert any(n.startswith(CT_STORED_UNCLIPPED) for n in v.notes)
+    assert dev.lit_up == 0
+    # the placeholder bulb: declines, naming the declaration, and never switches on for it
+    dev = FakeDevice(clock, TRIANGLE, ct_range=None, ct_limits=(50, 1000))
     v = measure(dev, allow_lit=True, clock=clock)
-    assert v is not None and v.polygon is not None and v.ct_range_k == (2000, 6535)
-    assert v.ct_answers == ((50, 153), (1000, 500)) and dev.lit_up == 1
-    assert dev.ct_commands == 3  # one dark probe, then two lit
-    assert any("switched on for the colour temperature probes" in n for n in v.notes)
-    assert dev.restored
-    # the range alone, forced, on a dark bulb: the same light-up
-    dev = StoresCtWhileOff(clock, TRIANGLE)
+    assert v is not None and v.ct_range_k is None and v.ct_limits == (50, 1000)
+    assert any(
+        n.startswith(CT_DECLINED) and "50-1000 mired" in n and "vendor" in n for n in v.notes
+    )
+    assert dev.lit_up == 0
+    # credible probe answers win over the declared limits, with a note when they disagree
+    dev = FakeDevice(clock, TRIANGLE, ct_range=(200, 454), ct_limits=(153, 500))
+    v = measure(dev, clock=clock)
+    assert v is not None and v.ct_range_k == (2202, 5000)
+    assert any("disagree; the probes stand" in n for n in v.notes)
+    # a lit fixture with credible limits is not probed (the probes would flash it)
+    dev = FakeDevice(clock, TRIANGLE, lit=True, ct_range=None, ct_limits=(153, 500))
     v = measure(dev, allow_lit=True, clock=clock, xy=False)
-    assert v is not None and v.ct_range_k == (2000, 6535) and dev.lit_up == 1
-    # already lit: measured as it is, no switch
-    dev = StoresCtWhileOff(clock, TRIANGLE, lit=True)
-    v = measure(dev, allow_lit=True, clock=clock, xy=False)
-    assert v is not None and v.ct_range_k == (2000, 6535) and dev.lit_up == 0
+    assert v is not None and v.ct_range_k == (2000, 6535) and dev.ct_commands == 0
+    # a device that never answers the limits read is probed and, clipping, measured
+    dev = FakeDevice(clock, TRIANGLE, ct_range=(153, 500), ct_limits=None)
+    v = measure(dev, clock=clock, xy=False)
+    assert v is not None and v.ct_range_k == (2000, 6535) and v.ct_limits is None
+    assert any("did not answer the colour temperature limits read" in n for n in v.notes)
 
 
 def test_an_interruption_during_the_range_probes_keeps_the_polygon() -> None:
@@ -236,7 +246,7 @@ def test_an_interruption_during_the_range_probes_keeps_the_polygon() -> None:
     dev = LitDuringCt(clock, TRIANGLE)
     v = measure(dev, clock=clock)
     assert v is not None and v.polygon is not None and v.aborted is None
-    assert v.ct_range_k is None and dev.ct_commands == 1
+    assert v.ct_range_k is None and dev.ct_commands == 1 and v.ct_limits == (153, 500)
     assert any("range not measured: fixture turned on" in n for n in v.notes)
     assert dev.restored and dev.restore_transition == 0.0  # put back at once
     # the same interruption on a range-only run is the run's abort

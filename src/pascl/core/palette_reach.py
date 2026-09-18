@@ -31,17 +31,16 @@ from typing import Final, Literal
 
 from pascl.core.gamut import XY, ClipRule, Polygon, clip
 from pascl.core.palette import CCT_COOL_K, CCT_NIGHT_K, kelvin_xy
-from pascl.model import HomeModel, fixture_cct_range
+from pascl.model import CREDIBLE_KELVIN, HomeModel, fixture_cct_range
 
 #: An entry further than this per axis from its clip is reported; below it the clip is
 #: within a transport's own rounding and no one could tell.
 MIN_GAP: Final = 0.001
 #: How finely the solar arcs are sampled, in kelvin.
 ARC_STEP_K: Final = 25.0
-#: The colour temperatures a white-tunable emitter can plausibly reach: no LED sold goes
-#: below ~1700 K or above ~9000 K. A range beyond this is a transport's placeholder, not a
-#: measurement, and the render is floored at a number the device will clip.
-CREDIBLE_K: Final[tuple[int, int]] = (1500, 10000)
+#: The credible band (``pascl.model.CREDIBLE_KELVIN``): a range beyond it is a placeholder,
+#: and the render is floored at a number the device will clip.
+CREDIBLE_K: Final[tuple[int, int]] = CREDIBLE_KELVIN
 
 
 @dataclass(frozen=True)

@@ -23,11 +23,13 @@ command (it does not apply colour while off; in the forced mode the driver switc
 starts over, otherwise it says so and stops), answer nothing at all (not reachable this way),
 or still be changing colour when the sample runs out (a ramp too slow to measure).
 
-After the polygon, the colour-temperature range: two probes past any real device's ends
-(``CT_PROBES_MIRED``), commanded and read back under the same timing rules (``take_ct_sample``,
-``measure_ct``), the pair of answers forming the range or, when a probe went unanswered or the
-answers are not a physical range, nothing (``ct_range_from``). A material without a colour
-temperature is not probed (``ct=False``), and ``xy=False`` measures the range alone.
+After the polygon, the colour-temperature range: the limits the device declares
+(``colorTempPhysicalMin`` / ``Max``, one read, ``read_ct_limits``) and two probes past any real
+device's ends (``CT_PROBES_MIRED``), commanded and read back under the same timing rules
+(``take_ct_sample``); credible probe answers are where the device clips, credible declared
+limits are its own word when it clips nothing, and anything else is declined
+(``ct_range_from``). A material without a colour temperature is not probed (``ct=False``), and
+``xy=False`` measures the range alone.
 
 A measured fixture holds a probe colour for as long as a sample lasts, and a fixture that is
 turned on then shows that colour. Three things end a measurement early, all of them meant to
@@ -49,7 +51,15 @@ from typing import Final, Literal, Protocol
 
 from pascl.clock import Clock, SystemClock
 from pascl.core.gamut import XY
-from pascl.estimator.gamut import CT_PROBES_MIRED, Probe, Verdict, ct_range_from, is_echo
+from pascl.estimator.gamut import (
+    CT_PROBES_MIRED,
+    Probe,
+    Verdict,
+    credible,
+    ct_range_from,
+    is_echo,
+    kelvin_range,
+)
 from pascl.model import Gamut
 
 #: Seconds after the command before the first read-back: the device applies a zero transition
@@ -98,6 +108,9 @@ class Observation:
     mired: int | None = None
     """The device's colour temperature, for an observation made under a colour-temperature
     command (``command_ct``); ``xy`` is then None."""
+    ct_limits: tuple[int, int] | None = None
+    """The colour-temperature limits the device declares (coolest, warmest; mireds), answering
+    ``read_ct_limits``."""
 
 
 class DeviceChannel(Protocol):
@@ -128,6 +141,10 @@ class DeviceChannel(Protocol):
 
     def read(self) -> None:
         """Ask the device to report its current colour (a colour temperature comes with it)."""
+
+    def read_ct_limits(self) -> None:
+        """Ask the device for the colour-temperature limits it declares (its physical minimum
+        and maximum, mireds); the answer is an observation carrying ``ct_limits``."""
 
     def observe(self, seconds: float) -> list[Observation]:
         """Block up to ``seconds`` and return what arrived, classified."""
@@ -348,9 +365,22 @@ def take_ct_sample(
     )
 
 
-#: The reasons the range probes decline, as prefixes of the verdict's notes.
-CT_STORED_WHILE_OFF: Final = "the device stores a colour temperature unclipped while off"
+#: The reasons the range stage declines, as prefixes of the verdict's notes.
+CT_STORED_UNCLIPPED: Final = "the device stores a colour temperature unclipped"
 CT_DECLINED: Final = "colour temperature range declined"
+
+
+def read_ct_limits(channel: DeviceChannel, clock: Clock) -> tuple[int, int] | None:
+    """The limits the device declares (coolest, warmest; mireds), or None when it did not
+    answer within ``ANSWER_TIMEOUT``. Other observations that arrive meanwhile are dropped:
+    nothing is in flight that they could be evidence for."""
+    channel.read_ct_limits()
+    end = clock.monotonic() + ANSWER_TIMEOUT
+    while clock.monotonic() < end:
+        for ob in channel.observe(max(MIN_WAIT, min(POLL, end - clock.monotonic()))):
+            if ob.ct_limits is not None:
+                return ob.ct_limits
+    return None
 
 
 def measure_ct(
@@ -361,30 +391,38 @@ def measure_ct(
     lit: bool | None = None,
     abort_when: Callable[[], str | None] | None = None,
     on_sample: Callable[[Sample], None] | None = None,
-) -> tuple[tuple[int, int] | None, tuple[tuple[int, int | None], ...], tuple[str, ...], str | None]:
-    """The colour-temperature range of the fixture on ``channel``: the two probes in
-    ``CT_PROBES_MIRED`` commanded and read back, with a foreign command retaking the sample
-    once. Returns the range (``ct_range_from``, None when declined), the answers, notes for
-    the verdict, and the interruption that cut it short, if one did (the caller restores at
-    once; the fixture is not put back here). Runs after the polygon protocol, or on its own
-    for a fixture whose polygon is already known.
+) -> tuple[
+    tuple[int, int] | None,
+    tuple[tuple[int, int | None], ...],
+    tuple[int, int] | None,
+    tuple[str, ...],
+    str | None,
+]:
+    """The colour-temperature range of the fixture on ``channel``: the limits it declares
+    (one read) and the two probes in ``CT_PROBES_MIRED``, commanded and read back, a foreign
+    command retaking a sample once. Returns the range (``ct_range_from``, None when declined),
+    the probe answers, the declared limits, notes for the verdict, and the interruption that
+    cut it short, if one did (the caller restores at once; the fixture is not put back here).
+    Runs after the polygon protocol, or on its own for a fixture whose polygon is already
+    known.
 
-    A device that answers a probe with the probe's own value, or that does not apply it,
-    cannot be measured dark: Hue bulbs store a colour temperature UNCLIPPED while off (the
-    attribute is clipped only while the emitter is lit; the reference installation's 22
-    placeholder-range bulbs all answered 50 and 1000 to the two probes while off, and 501 to
-    a lit 678) where they clip an xy while off. In the forced mode such a fixture (``lit``
-    False) is switched on and both probes are taken again, lit, as the polygon protocol does
-    for a device that keeps its colour while off; ``restore`` turns it off again after the
-    colour is back. Otherwise the range is declined with a note naming the forced mode."""
+    The probes are where a device that clips its attribute lands; a device that stores the
+    command unclipped answers the probe's own value, lit or dark (every Hue bulb on the
+    reference installation does), and its range is then its declared limits when those are
+    credible, nothing otherwise. A lit fixture whose limits are credible is not probed (the
+    probes would flash it for a check the dark case makes invisibly)."""
     answers: dict[int, int | None] = {}
     notes: list[str] = []
-    lit_up = False
-    i = 0
-    while i < len(CT_PROBES_MIRED):
-        mired = CT_PROBES_MIRED[i]
+    if abort_when is not None and (reason := abort_when()) is not None:
+        return None, (), None, (), reason
+    limits = read_ct_limits(channel, clock)
+    declared = kelvin_range(limits)
+    if limits is None:
+        notes.append("the device did not answer the colour temperature limits read")
+    skip_probes = bool(lit) and credible(declared)
+    for mired in () if skip_probes else CT_PROBES_MIRED:
         if abort_when is not None and (reason := abort_when()) is not None:
-            return None, tuple(answers.items()), tuple(notes), reason
+            return None, tuple(answers.items()), limits, tuple(notes), reason
         sample = take_ct_sample(channel, mired, clock, interrupt=not allow_lit)
         if on_sample is not None:
             on_sample(sample)
@@ -401,34 +439,40 @@ def measure_ct(
                 if sample.occupied and not sample.lit
                 else "fixture turned on during the measurement"
             )
-            return None, tuple(answers.items()), tuple(notes), reason
-        dark_answer = sample.mired == mired or (sample.mired is None and sample.unapplied)
-        if dark_answer and not lit_up and allow_lit and not lit and channel.light_up():
-            # measured lit instead, from the first probe; restore turns it off again
-            lit_up = True
-            answers.clear()
-            _wait(channel, clock, RETAKE_PAUSE)
-            i = 0
-            continue
+            return None, tuple(answers.items()), limits, tuple(notes), reason
         answers[mired] = sample.mired
         if sample.mired is None:
             what = "not applied" if sample.unapplied else "unanswered"
             notes.append(f"colour temperature probe {mired} mired {what}")
         _wait(channel, clock, PAUSE)
-        i += 1
-    rng = ct_range_from(answers)
-    if lit_up:
-        notes.append(f"switched on for the colour temperature probes: {CT_STORED_WHILE_OFF}")
-    if rng is None and all(v is not None for v in answers.values()):
-        got = ", ".join(f"{m}->{v}" for m, v in answers.items())
-        if any(v == m for m, v in answers.items()) and not lit:
+    rng = ct_range_from(answers, limits)
+    unclipped = bool(answers) and all(v == m for m, v in answers.items())
+    if unclipped:
+        notes.append(f"{CT_STORED_UNCLIPPED}: the probes answered their own values")
+    if rng is None:
+        if limits is not None and not credible(declared):
+            lo, hi = limits
             notes.append(
-                f"{CT_DECLINED}: the probes answered {got}; {CT_STORED_WHILE_OFF}, or the "
-                f"transport echoed; the forced mode measures it lit"
+                f"{CT_DECLINED}: the device declares {lo}-{hi} mired"
+                + (
+                    f" ({declared[0]}-{declared[1]} K)"
+                    if declared is not None
+                    else " (not a range)"
+                )
+                + ", the attribute's whole span rather than its emitter; declare the range "
+                "in the model from the vendor's specification"
             )
+        elif answers and all(v is not None for v in answers.values()):
+            got = ", ".join(f"{m}->{v}" for m, v in answers.items())
+            notes.append(f"{CT_DECLINED}: the probes answered {got} and no limits were declared")
         else:
-            notes.append(f"{CT_DECLINED}: the probes answered {got}")
-    return rng, tuple(answers.items()), tuple(notes), None
+            notes.append(f"{CT_DECLINED}: no usable answer")
+    elif declared is not None and rng != declared:
+        notes.append(
+            f"the probes ({rng[0]}-{rng[1]} K) and the declared limits "
+            f"({declared[0]}-{declared[1]} K) disagree; the probes stand"
+        )
+    return rng, tuple(answers.items()), limits, tuple(notes), None
 
 
 def measure(
@@ -482,6 +526,7 @@ def measure(
     unconfirmed = ramped = unsettled = 0
     ct_range: tuple[int, int] | None = None
     ct_answers: tuple[tuple[int, int | None], ...] = ()
+    ct_limits: tuple[int, int] | None = None
     ct_notes: tuple[str, ...] = ()
     cut: str | None = None
     try:
@@ -530,7 +575,7 @@ def measure(
                 previous = sample.xy
             _wait(channel, clk, PAUSE)
         if ct and aborted is None:
-            ct_range, ct_answers, ct_notes, cut = measure_ct(
+            ct_range, ct_answers, ct_limits, ct_notes, cut = measure_ct(
                 channel,
                 clk,
                 allow_lit=allow_lit,
@@ -564,7 +609,13 @@ def measure(
             f"when the sample ran out"
         )
     if aborted is None:
-        return replace(verdict, notes=tuple(notes), ct_range_k=ct_range, ct_answers=ct_answers)
+        return replace(
+            verdict,
+            notes=tuple(notes),
+            ct_range_k=ct_range,
+            ct_answers=ct_answers,
+            ct_limits=ct_limits,
+        )
     return replace(
         verdict,
         polygon=None,
@@ -573,6 +624,7 @@ def measure(
         notes=(*notes, f"aborted: {aborted}"),
         aborted=aborted,
         ct_answers=ct_answers,
+        ct_limits=ct_limits,
     )
 
 

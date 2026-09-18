@@ -24,10 +24,14 @@ Rules the reference installation's fleet taught, each one a measurement that wen
   fixture that was off is reported as ``lit`` and the driver aborts, since the probe colours
   are on the wall from then on. A group command lights a device without any message on its
   own ``/set`` topic, so the state report is the only signal that catches every case.
-* A colour temperature is measured the same way (``command_ct``, ``color_temp`` in mireds):
+* A colour temperature is probed the same way (``command_ct``, ``color_temp`` in mireds):
   the echo is the command's own value, a read-back is the device's, the endpoint key keeps
   the echo on a multi-endpoint device, and a read-back showing the value from before the
   command is ``unapplied``. The same ``/get`` answers colour and colour temperature at once.
+  The limits a device declares (``read_ct_limits``) come through Zigbee2MQTT's attribute read
+  (``{"read": {...}}`` on the ``/set`` topic with a ``state_property``), which lands the two
+  attributes under that property on the base topic; the transport keeps the property in the
+  device's state afterwards, so it counts only while a request is outstanding.
 * The transport's identity for a device is its IEEE address, read from the retained
   ``bridge/devices`` list (``discover``), suffixed with the endpoint for a multi-endpoint
   device. A topic is a name the user can change; the address survives a rename and changes
@@ -54,6 +58,19 @@ currentY and colorTemperature, and publishes the device's whole state on its bas
 for ``color_temp`` as well doubles the frame for nothing, and asking for ``state`` alongside
 adds the on/off cluster; the settle read wants exactly this string, and a consumer that carries
 it (the reference installation's generated Jinja) is checked against it verbatim."""
+
+CT_LIMITS_PROPERTY: Final = "colour_temperature_limits"
+CT_LIMITS_PAYLOAD: Final = json.dumps(
+    {
+        "read": {
+            "cluster": "lightingColorCtrl",
+            "attributes": ["colorTempPhysicalMin", "colorTempPhysicalMax"],
+            "state_property": CT_LIMITS_PROPERTY,
+        }
+    }
+)
+"""Zigbee2MQTT's attribute read of the colour-temperature limits a device declares, answered
+under ``CT_LIMITS_PROPERTY`` in the device's state on its base topic."""
 
 
 class MqttLink(Protocol):
@@ -195,6 +212,24 @@ def _mired(payload: dict[str, object], key: str) -> int | None:
     return round(v)
 
 
+def _limits(payload: dict[str, object], endpoint: str | None) -> tuple[int, int] | None:
+    """The declared limits (coolest, warmest; mireds) under ``CT_LIMITS_PROPERTY``, the
+    endpoint-suffixed key first on a multi-endpoint device."""
+    keys = (
+        [f"{CT_LIMITS_PROPERTY}_{endpoint}", CT_LIMITS_PROPERTY]
+        if endpoint
+        else [CT_LIMITS_PROPERTY]
+    )
+    for key in keys:
+        v = payload.get(key)
+        if not isinstance(v, dict):
+            continue
+        lo, hi = _mired(v, "colorTempPhysicalMin"), _mired(v, "colorTempPhysicalMax")
+        if lo is not None and hi is not None:
+            return (lo, hi)
+    return None
+
+
 def _near(a: XY, b: XY, tol: float = ECHO_TOL) -> bool:
     return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
 
@@ -261,6 +296,7 @@ class Z2MDeviceChannel:
         self._read_sent = False
         self._seen_unsuffixed: list[XY] = []
         self._seen_unsuffixed_ct: list[int] = []
+        self._limits_requested = False
         self._before: dict[str, object] | None = None
         self._last_seen: XY | None = None
         self._last_seen_ct: int | None = None
@@ -417,6 +453,11 @@ class Z2MDeviceChannel:
         self._read_sent = True
         self._link.publish(self._get_topic, READ_COLOUR_PAYLOAD)
 
+    def read_ct_limits(self) -> None:
+        self._sent.append(CT_LIMITS_PAYLOAD)
+        self._limits_requested = True
+        self._link.publish(self._set_topic, CT_LIMITS_PAYLOAD)
+
     def observe(self, seconds: float) -> list[Observation]:
         out: list[Observation] = []
         for topic, raw in self._link.drain(seconds):
@@ -441,6 +482,11 @@ class Z2MDeviceChannel:
                 continue
             if self._endpoint_view(payload).get("state") == "ON":
                 out.append(Observation("lit"))
+            if self._limits_requested:
+                limits = _limits(payload, self._ep)
+                if limits is not None:
+                    self._limits_requested = False
+                    out.append(Observation("device", trusted=True, ct_limits=limits))
             ob = self._classify(payload)
             if ob is not None:
                 out.append(ob)

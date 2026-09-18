@@ -52,7 +52,14 @@ from pascl.core.gamut import (
     polygon_problems,
     project,
 )
-from pascl.model import KELVIN_MAX, KELVIN_MIN, Gamut, HomeModel, with_fixture_gamut
+from pascl.model import (
+    CREDIBLE_KELVIN,
+    KELVIN_MAX,
+    KELVIN_MIN,
+    Gamut,
+    HomeModel,
+    with_fixture_gamut,
+)
 from pascl.model.geometry import MAX_VERTICES, SAME_MODEL_FAIL, vertex_deviation
 
 #: Far-outside valid chromaticities (x, y >= 0.02, x + y <= 0.99), ordered so consecutive
@@ -112,11 +119,13 @@ INTERIOR_TOL: Final = 0.002
 #: times the rule's median gap is one the rule cannot account for and is set aside.
 OUTLIER_FLOOR: Final = 0.005
 OUTLIER_FACTOR: Final = 10.0
-#: The colour temperatures commanded to find a device's range, in mireds, coolest first:
-#: past any real device's coolest (50 mired, 20000 K) and warmest (1000 mired, 1000 K), so
-#: the device clips to its physical limits and answers them. Coolest first because a fixture
-#: at rest is far more often at its warm end (the night floor) than at its cool one, and a
-#: probe answered with the resting value is indistinguishable from one not applied.
+#: The colour temperatures commanded to check a device's range, in mireds, coolest first:
+#: past any real device's coolest (50 mired, 20000 K) and warmest (1000 mired, 1000 K). A
+#: device that clips its colour-temperature attribute answers its limits; a Hue bulb does not
+#: clip the attribute at all (it stores what it is sent, lit or dark, and the emitter clips
+#: physically), so the range comes from the limits the device DECLARES (``colorTempPhysicalMin``
+#: / ``Max``, read in one frame) and the probes only check them. Coolest first because a
+#: fixture at rest is far more often at its warm end.
 CT_PROBES_MIRED: Final[tuple[int, int]] = (50, 1000)
 
 Kind = Literal["far", "vertex", "edge"]
@@ -165,27 +174,65 @@ class Verdict:
     probes in ``CT_PROBES_MIRED``; None when not measured or declined (``ct_range_from``)."""
     ct_answers: tuple[tuple[int, int | None], ...] = ()
     """The evidence: each colour-temperature probe (mireds) with the device's answer."""
+    ct_limits: tuple[int, int] | None = None
+    """The limits the device declares (``colorTempPhysicalMin``, ``Max``; mireds, coolest
+    first), the other half of the evidence; None when it did not answer."""
 
 
-def ct_range_from(answers: Mapping[int, int | None]) -> tuple[int, int] | None:
-    """The device's colour-temperature range, kelvin (floor, ceiling), from its answers
-    (mireds) to the probes in ``CT_PROBES_MIRED``. Declined, None, when a probe went
-    unanswered, when the device answered a probe with the probe's own value (the echo, or a
-    device that claims 1000-20000 K, neither a physical limit), or when the pair is not an
-    ordered range inside ``KELVIN_MIN``-``KELVIN_MAX``. Kelvin are truncated the way a host
-    converts them, so the range compares exactly with what the host reports."""
-    cool_probe, warm_probe = CT_PROBES_MIRED
-    coolest, warmest = answers.get(cool_probe), answers.get(warm_probe)
-    if coolest is None or warmest is None:
+def kelvin_range(mireds: tuple[int, int] | None) -> tuple[int, int] | None:
+    """(floor_k, ceiling_k) from a (coolest, warmest) mired pair; None unless it is an ordered
+    pair inside ``KELVIN_MIN``-``KELVIN_MAX``. Kelvin are truncated the way a host converts
+    them, so the range compares exactly with what the host reports."""
+    if mireds is None:
         return None
-    if coolest == cool_probe or warmest == warm_probe:
-        return None
+    coolest, warmest = mireds
     if coolest <= 0 or warmest <= 0:
         return None
     floor_k, ceiling_k = mired_to_kelvin(warmest), mired_to_kelvin(coolest)
     if not KELVIN_MIN <= floor_k < ceiling_k <= KELVIN_MAX:
         return None
     return (floor_k, ceiling_k)
+
+
+def credible(range_k: tuple[int, int] | None) -> bool:
+    """A range a physical emitter could have (inside ``CREDIBLE_KELVIN``); a bulb declaring
+    1000-20000 K has declared the attribute's whole span, not its emitter."""
+    return (
+        range_k is not None and CREDIBLE_KELVIN[0] <= range_k[0] < range_k[1] <= CREDIBLE_KELVIN[1]
+    )
+
+
+def ct_range_from(
+    answers: Mapping[int, int | None], limits: tuple[int, int] | None = None
+) -> tuple[int, int] | None:
+    """The device's colour-temperature range, kelvin (floor, ceiling).
+
+    Two sources, the device's own both. ``limits`` is what the device declares as its
+    physical limits (``colorTempPhysicalMin`` / ``Max``, mireds); ``answers`` are its answers
+    (mireds) to the probes in ``CT_PROBES_MIRED``. A probe answered with the probe's own value
+    says the device stored the command unclipped (a Hue does, lit or dark) and is no evidence
+    of a limit. The rule: credible probe answers win (they are where the device clipped); else
+    credible declared limits; else None. On the reference installation 63 of 85 fixtures
+    declare 153-500 mired and the transport clamps commands to that, so their probes answer
+    the limits; 22 declare 50-1000 mired (the attribute's whole span) and store any command,
+    so nothing about them is credible and the range is declined, for the author to declare
+    from the vendor's specification."""
+    cool_probe, warm_probe = CT_PROBES_MIRED
+    coolest, warmest = answers.get(cool_probe), answers.get(warm_probe)
+    probed: tuple[int, int] | None = None
+    if (
+        coolest is not None
+        and warmest is not None
+        and coolest != cool_probe
+        and warmest != warm_probe
+    ):
+        probed = kelvin_range((coolest, warmest))
+    if credible(probed):
+        return probed
+    declared = kelvin_range(limits)
+    if credible(declared):
+        return declared
+    return None
 
 
 def is_echo(command: XY, reported: XY, tol: float = ECHO_TOL) -> bool:

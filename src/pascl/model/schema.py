@@ -93,6 +93,11 @@ KELVIN_MAX = 20000
 """The widest colour-temperature range any transport declares (Zigbee's colorTemperature
 attribute spans 1000-20000 K); a measured range must sit inside it."""
 
+CREDIBLE_KELVIN = (1500, 10000)
+"""The colour temperatures a white-tunable emitter can plausibly reach: no LED sold goes below
+~1700 K or above ~9000 K. A range beyond this is a placeholder (a bulb declaring the whole
+Zigbee attribute range as its physical limits), not a measurement."""
+
 
 class ModelError(ValueError):
     """The model could not be loaded or does not validate. ``errors`` lists every problem."""

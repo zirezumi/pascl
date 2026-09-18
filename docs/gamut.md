@@ -356,35 +356,44 @@ section's, and the report interval and jitter describe the reports it no longer 
 ## 11. The colour-temperature range is measured too (`Gamut.ct_range_k`)
 
 A fixture that takes a colour temperature clips one outside its range exactly as it clips a
-chromaticity outside its polygon, and the range the transport declares is what the device
-advertises, not what it does. On the reference installation 22 bulbs of one model advertise
-1000-20000 K over a physical 2000-6535 K; the render, flooring the night white at the
-declaration, sent them 1475 K, the devices showed 2000 K, and a comparator judging them against
-the intent would have repainted them every 30 s all night. So the range is measured with the
-polygon: two probes past any real device's ends (`CT_PROBES_MIRED`, 50 and 1000 mired, coolest
-first because a fixture at rest is far more often at its warm end), each read back and confirmed
-under the polygon's timing rules (`take_ct_sample`, `measure_ct`), and the two answers form the
-range (`ct_range_from`), in kelvin truncated the way a host converts them so the range compares
-exactly with what the host reports. The measurement declines rather than guesses: a probe
-unanswered, a probe answered with its own value (the transport's echo, or a device claiming
-1000-20000 K), or a pair that is not an ordered range inside 1000-20000 K yields `None`, with
-the evidence in the verdict's notes.
+chromaticity outside its polygon, and the range the host declares is what the device advertises,
+not what it does. On the reference installation 22 bulbs of one model advertise 1000-20000 K
+over a physical ~2000-6500 K; the render, flooring the night white at the declaration, sent them
+1475 K, the emitters showed 2000 K, and a comparator fed by a report of that would repaint them
+every 30 s all night. So the range is measured with the polygon, and the measurement has two
+sources, both the device's own (`measure_ct`):
 
-One thing the polygon protocol never met: a Hue bulb clips an xy while off but stores a colour
-temperature UNCLIPPED while off, and clips it only while the emitter is lit (all 22 placeholder
-bulbs on the reference installation answered 50 and 1000 to the two probes while dark, and 501
-to a lit 678). So the range of such a device cannot be measured invisibly. In the invisible
-mode the answer-equals-probe case is declined by name (`CT_DECLINED`, `CT_STORED_WHILE_OFF`);
-in the forced mode the driver switches the dark fixture on at the first such answer, takes both
-probes again lit (a second or two of the device's coolest then warmest white), and `restore`
-puts the colour back before switching it off, the machinery the polygon protocol already has
-for a device that keeps its colour while off.
+- the limits the device DECLARES, `colorTempPhysicalMin` / `Max`, read in one frame
+  (`read_ct_limits`; on a Zigbee2MQTT transport an attribute read answered into the device's
+  state, on a host entity its `min_color_temp_kelvin` / `max_color_temp_kelvin`);
+- two probes past any real device's ends (`CT_PROBES_MIRED`, 50 and 1000 mired, coolest first),
+  each commanded and read back under the polygon's timing rules (`take_ct_sample`): where a
+  device that clips its attribute lands.
+
+`ct_range_from` takes credible probe answers first (the device clipped there), else credible
+declared limits, else nothing; a range is credible inside `CREDIBLE_KELVIN` (1500-10000 K), and
+kelvin are truncated the way a host converts them so the range compares exactly with what the
+host reports. The evidence travels with the verdict (`ct_answers`, `ct_limits`) and the reasons
+for a decline are notes (`CT_DECLINED`, `CT_STORED_UNCLIPPED`).
+
+What the reference installation taught, in one evening: no Hue bulb clips the
+colour-temperature ATTRIBUTE. Lit or dark it stores what it is sent and answers a read with
+that (every one of 22 answered 50 and 1000 to the two probes, lit as well as dark), while the
+emitter clips physically and only a native state push says where. The 63 other bulbs declare
+153-500 mired and the transport clamps commands to the declared limits, so their probes answer
+the limits, which is the transport's clamp of the device's declaration, never the emitter. Hence
+the rule: the declaration is the device's word when it is credible, the probes are a check, and
+a bulb declaring 50-1000 mired (the attribute's whole span) is declined by name for the author
+to declare its range in the model from the vendor's specification (`Material.cct_range_k`,
+which `fixture_cct_range` falls back to, and which `pascl palette check` flags as not credible
+until it is). A lit fixture whose limits are credible is not probed at all, since the probes
+would flash it for a check the dark case makes invisibly.
 
 The range travels like the polygon (a seed copies it) and is consumed in two places: the render
 floors a white at the MEASURED range when the fixture has one, else the material's declaration,
 else 2000 K; and a comparator judges the device against the intent clipped to the range, as it
 judges chromaticity against the intent clipped to the polygon. A material without `cct` is never
-probed (the runtime passes `ct=False`); an interruption during the two probes keeps a polygon
+probed (the runtime passes `ct=False`); an interruption during the range stage keeps a polygon
 already measured and declines the range with a note, since the polygon's evidence is complete;
 and `pascl gamut measure --ct-only` measures the range alone, in seconds, for a fixture whose
 polygon is on record.

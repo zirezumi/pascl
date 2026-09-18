@@ -133,3 +133,14 @@ def test_entity_channel_commands_a_colour_temperature_in_kelvin_and_reads_it_bac
     host.relay("on", (0.6915, 0.3083), 6535)
     obs = ch.observe(0.1)
     assert [(o.kind, o.xy, o.mired) for o in obs] == [("device", (0.6915, 0.3083), None)]
+    # the declared limits are the entity's kelvin attributes, answered as mireds, once
+    host.state = {
+        "state": "on",
+        "attributes": {"min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 6535},
+    }
+    ch.read_ct_limits()
+    assert [o.ct_limits for o in ch.observe(0.1)] == [(153, 500)]
+    assert ch.observe(0.1) == []
+    host.state = {"state": "on", "attributes": {}}
+    ch.read_ct_limits()
+    assert ch.observe(0.1) == []  # a host that declares nothing answers nothing

@@ -12,6 +12,7 @@ within tolerance with no home-specific code.
 """
 
 from pascl.model.schema import (
+    CREDIBLE_KELVIN,
     KELVIN_MAX,
     KELVIN_MIN,
     SCHEMA_VERSION,
@@ -34,6 +35,7 @@ from pascl.model.schema import (
 )
 
 __all__ = [
+    "CREDIBLE_KELVIN",
     "KELVIN_MAX",
     "KELVIN_MIN",
     "SCHEMA_VERSION",

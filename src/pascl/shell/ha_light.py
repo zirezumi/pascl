@@ -111,6 +111,7 @@ class HALightChannel:
         self._read_sent = False
         self._last_seen: XY | None = None
         self._last_seen_ct: int | None = None
+        self._limits_requested = False
         self._before: dict[str, Any] | None = None
 
     @property
@@ -219,8 +220,27 @@ class HALightChannel:
         self._read_sent = True
         self._link.call_service("homeassistant", "update_entity", {"entity_id": self._entity})
 
+    def read_ct_limits(self) -> None:
+        """The host carries the device's declared limits as the entity's
+        ``min_color_temp_kelvin`` / ``max_color_temp_kelvin``; nothing goes to the device, and
+        the next ``observe`` answers from the entity's state."""
+        self._limits_requested = True
+
     def observe(self, seconds: float) -> list[Observation]:
         out: list[Observation] = []
+        if self._limits_requested:
+            self._limits_requested = False
+            st = self._link.get_state(self._entity)
+            attrs = (st or {}).get("attributes") or {}
+            lo_k, hi_k = attrs.get("min_color_temp_kelvin"), attrs.get("max_color_temp_kelvin")
+            if isinstance(lo_k, int | float) and isinstance(hi_k, int | float) and 0 < lo_k < hi_k:
+                out.append(
+                    Observation(
+                        "device",
+                        trusted=True,
+                        ct_limits=(kelvin_to_mired(float(hi_k)), kelvin_to_mired(float(lo_k))),
+                    )
+                )
         for topic, raw in self._link.drain(seconds):
             if topic in self._occupancy:
                 if _relayed_state(raw) == "on":
