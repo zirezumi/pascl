@@ -12,6 +12,7 @@ from pascl.core.settle import (
     ReadSchedule,
     arm_at,
     fade_end,
+    fade_end_of,
     read_at,
     worth_reading,
 )
@@ -28,6 +29,17 @@ def test_the_read_follows_the_fade_by_the_margin_and_the_arm_by_the_allowance_to
 def test_a_missing_or_negative_transition_ends_at_the_command():
     assert fade_end(50.0, 0.0) == 50.0
     assert fade_end(50.0, -3.0) == 50.0
+
+
+def test_a_fixture_stops_moving_at_the_latest_of_its_commands_on_any_channel():
+    # A colour command at 95 s over 5 s and a brightness-only command at 100 s over 30 s: the
+    # comparator judges the fixture, so it waits for the brightness fade, not the colour one.
+    assert fade_end_of((95.0, 5.0), (100.0, 30.0)) == 130.0
+    assert fade_end_of((100.0, 30.0), (95.0, 5.0)) == 130.0
+    # A later, shorter command does not pull the fade end back over one still in flight.
+    assert fade_end_of((100.0, 30.0), (110.0, 5.0)) == 130.0
+    assert fade_end_of((100.0, -1.0)) == 100.0
+    assert fade_end_of() == 0.0
 
 
 def test_the_constants_are_the_reference_installation_numbers():

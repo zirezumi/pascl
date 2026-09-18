@@ -330,7 +330,14 @@ ZCL frame answering colour mode, xy and colour temperature together, the device'
 republished on its base topic), and the comparator arms after the answer has had time to land.
 The rule, and the numbers the reference installation's generated templates carry verbatim:
 
-- the fade ends at the command plus its transition (`fade_end`);
+- the fade ends at the command plus its transition (`fade_end`), and a fixture with several
+  commands in flight stops moving at the latest of them (`fade_end_of`), whichever channel each
+  moved: brightness and colour are separate commands on most transports, and the comparator
+  judges the fixture. The reference installation derives that fade end from three timestamps
+  plus the scene transition (its scope's settling stamp when the fixture was commanded by that
+  render, the fixture's colour cache write, its brightness clock write); until 2026-09-18 the
+  brightness one was missing and a brightness-only fade whose scope a later, shorter pass had
+  re-stamped repainted at its fade end with no hold (a no-op frame);
 - the read goes out `READ_MARGIN_S` (1.5 s) after that, covering the device's coarse
   transition ticks and a host whose command time runs ahead of the frame (`read_at`);
 - the comparator arms `READ_ALLOWANCE_S` (4.0 s) after the read: the queue when every colour

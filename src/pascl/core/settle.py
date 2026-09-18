@@ -31,6 +31,15 @@ on the reference installation:
   render and their reads queue at the same fade end (23 colour fixtures on one radio on the
   reference installation), plus one transport-level retry.
 
+Every command counts, whichever channel it moved. Brightness and colour are separate commands
+on most transports, a brightness-only fade keeps the device moving exactly as a colour fade
+does, and a comparator judges the fixture, not a channel, so a fixture's fade end is the latest
+over the commands in flight on it (:func:`fade_end_of`). The reference installation derives
+that from three timestamps, each plus the scene transition: its scope's settling stamp (when
+the fixture was commanded by that render), the fixture's colour cache write and its brightness
+clock write. Until 2026-09-18 the brightness one was missing there, and a brightness-only fade
+whose scope was re-stamped by a later, shorter pass repainted at its fade end with no hold.
+
 A fixture commanded again before its read is due is not read twice: :class:`ReadSchedule`
 keeps one due time per fixture and a new command moves it. The reads themselves are the
 transport's business (``pascl.shell.z2m.READ_COLOUR_PAYLOAD``); this module only says when.
@@ -63,6 +72,13 @@ moved less than this on both axes since the previous command is not worth a read
 def fade_end(commanded_at: float, transition_s: float) -> float:
     """When a command's transition ends; a negative or missing transition ends at once."""
     return commanded_at + max(0.0, transition_s)
+
+
+def fade_end_of(*commands: tuple[float, float]) -> float:
+    """When a fixture with several commands in flight stops moving: the latest of their fade
+    ends, each command a ``(commanded_at, transition_s)`` pair on whatever channel it moved
+    (brightness, colour, or one carrying both). No commands: ``0.0``, the fade ended long ago."""
+    return max((fade_end(at, transition) for at, transition in commands), default=0.0)
 
 
 def read_at(fade_end: float) -> float:
