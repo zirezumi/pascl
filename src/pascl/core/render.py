@@ -20,7 +20,16 @@ from typing import Final, Literal
 from pascl.core import curves
 from pascl.core.color import XY, blend_xy, kelvin_to_mired
 from pascl.core.palette import NaturalWhite, natural_xy, scene_goal, warm_kelvin
-from pascl.model.schema import Calibration, Fixture, HomeModel, Material, Palette, Room
+from pascl.model.schema import (
+    Calibration,
+    Fixture,
+    HomeModel,
+    Material,
+    Palette,
+    Room,
+    fixture_cct_range,
+    fixture_cct_sources,
+)
 
 Phase = Literal["occupied", "fading", "vacant"]
 Mode = Literal["ct", "xy", "off"]
@@ -29,6 +38,10 @@ COLOR_FACTOR_DEADZONE: Final = 0.02
 CT_TOLERANCE_ENTER: Final = 0.003
 CT_TOLERANCE_HOLD: Final = 0.006
 DEFAULT_MIN_KELVIN: Final = 2000
+"""The policy floor when nothing in the room bounds a white: the warmest white most tunable
+emitters reach. It errs towards xy (a calibrated amber where a colour temperature might have
+done), never towards a colour temperature the device clips to a wrong white; the credible
+band's own floor (1500 K) would err the other way."""
 SLEEP_DIM_FRACTION: Final = 0.5
 
 
@@ -88,6 +101,38 @@ def _near(a: XY | None, b: XY | None, tol: float) -> bool:
     if a is None or b is None:
         return False
     return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
+
+
+def cct_floor(model: HomeModel, room_id: str, fixture_id: str) -> tuple[int, str]:
+    """The kelvin the render floors this fixture's white at, and where it came from: the
+    fixture's own resolved floor with its tier (``fixture_cct_sources``: probed, observed,
+    declared, inherited, or the author's word), else the POLICY floor, labelled ``policy``.
+
+    The policy is a render rule, never written into the fixture's range: an unbounded floor
+    renders whites the way its co-rendered bounded siblings do, the highest known floor among
+    the room's other colour-temperature fixtures, else ``DEFAULT_MIN_KELVIN``. It needs no
+    author, fails in the safe visible direction (a calibrated amber in xy rather than a white
+    the device clips), and the author's value replaces it the moment it is declared. Its
+    motivating case: 22 bulbs whose floor no tier could observe, rendering mixed whites and
+    ambers beside their bounded neighbours until someone found a specification sheet."""
+    floor_k, source = (
+        fixture_cct_range(model, fixture_id)[0],
+        fixture_cct_sources(model, fixture_id)[0],
+    )
+    if floor_k is not None and source is not None:
+        return floor_k, source
+    room = model.rooms.get(room_id)
+    siblings: list[int] = []
+    for fid, fx in room.fixtures.items() if room is not None else ():
+        if fid == fixture_id:
+            continue
+        mat = model.materials.get(fx.material)
+        if mat is None or "cct" not in mat.capabilities:
+            continue
+        lo, src = fixture_cct_range(model, fid)[0], fixture_cct_sources(model, fid)[0]
+        if lo is not None and src is not None:
+            siblings.append(lo)
+    return (max(siblings) if siblings else DEFAULT_MIN_KELVIN), "policy"
 
 
 def render_fixture(
@@ -171,15 +216,12 @@ def render_fixture(
     can_ct = "cct" in material.capabilities and goal_xy is not None
     matches_natural = can_ct and natural_bulb is not None and _near(goal_xy, natural_bulb, tol)
     matches_warm = can_ct and warm_bulb is not None and _near(goal_xy, warm_bulb, tol)
-    # The floor is the MEASURED one when the fixture has it (``Gamut.ct_range_k``): a material's
-    # declaration is what the transport advertised, and a bulb advertising 1000 K over a
-    # physical 2000 K would be sent colour temperatures it clips, then judged against them.
-    ct_range = (
-        fx.gamut.ct_range_k
-        if fx.gamut is not None and fx.gamut.ct_range_k is not None
-        else material.cct_range_k
-    )
-    min_k = ct_range[0] if ct_range else DEFAULT_MIN_KELVIN
+    # The floor is the derived one when a tier spoke for it (``Gamut.ct_sources``, resolved by
+    # ``fixture_cct_range``), else the material's declaration, else the policy floor
+    # (``cct_floor``): a transport's advertisement is what the device says, and a bulb
+    # advertising 1000 K over a physical 2000 K would be sent colour temperatures it clips,
+    # then judged against them.
+    min_k, _floor_source = cct_floor(model, room_id, fixture_id)
     ceiling_mired = kelvin_to_mired(min_k)
     goal_ct: int | None = None
     use_ct = False

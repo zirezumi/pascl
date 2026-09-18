@@ -175,6 +175,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="forced mode: lit fixtures and occupied rooms too, visibly",
     )
 
+    ob = gs.add_parser(
+        "observe-ct",
+        help="judge a fixture's colour-temperature range from (commanded, reported) pairs a "
+        "transport gathered, and record what is published on its gamut",
+    )
+    ob.add_argument("--model", required=True, type=Path)
+    ob.add_argument("--fixture", required=True, help="the fixture the pairs belong to")
+    ob.add_argument(
+        "--pairs",
+        required=True,
+        type=Path,
+        help="JSON: a list of [commanded, reported] mired pairs, or an object with a 'pairs' key",
+    )
+    ob.add_argument("--write", type=Path, help="write the model with the range recorded")
+
     pa = sub.add_parser("palette", help="palette checks against the measured gamuts")
     ps = pa.add_subparsers(dest="palette_command")
     pc = ps.add_parser(
@@ -354,7 +369,14 @@ def _cmd_gamut(args: argparse.Namespace) -> int:
     measure next, the plan a measurement follows, and the seeds a measurement gives its
     same-model siblings. The measurement itself needs a transport and lives with the
     adapters; these are the pure views of it."""
-    from pascl.estimator.gamut import FAR_POINTS, consistency, inherit, pick_target, statuses
+    from pascl.estimator.gamut import (
+        FAR_POINTS,
+        consistency,
+        inherit,
+        inherit_ct,
+        pick_target,
+        statuses,
+    )
     from pascl.model import dumps, load
 
     if args.gamut_command == "plan":
@@ -389,19 +411,81 @@ def _cmd_gamut(args: argparse.Namespace) -> int:
         for s in applied:
             verb = "refresh" if s.refresh else "seed"
             print(f"{verb:8s} {s.room:20s} {s.fixture:32s} from {s.source}  [{s.label}]")
-        print(f"{len(applied)} seed(s)", file=sys.stderr)
-        if args.write is not None and applied:
+        seeded, ct_applied = inherit_ct(seeded)
+        for c in ct_applied:
+            print(f"{'ct ' + c.end:8s} {c.fixture:32s} {c.kelvin} K from {c.source}  [{c.label}]")
+        print(
+            f"{len(applied)} seed(s), {len(ct_applied)} colour temperature end(s)", file=sys.stderr
+        )
+        if args.write is not None and (applied or ct_applied):
             args.write.write_text(dumps(seeded), encoding="utf-8")
             print(f"written to {args.write}", file=sys.stderr)
         return 0
+    if args.gamut_command == "observe-ct":
+        return _cmd_gamut_observe_ct(args, model)
     if args.gamut_command == "ids":
         return _cmd_gamut_ids(args, model)
     if args.gamut_command == "measure":
         return _cmd_gamut_measure(args, model)
     if args.gamut_command == "auto":
         return _cmd_gamut_auto(args, model)
-    print("usage: pascl gamut {status,plan,pick,inherit,ids,measure,auto} ...", file=sys.stderr)
+    print(
+        "usage: pascl gamut {status,plan,pick,inherit,ids,measure,auto,observe-ct} ...",
+        file=sys.stderr,
+    )
     return 2
+
+
+def _cmd_gamut_observe_ct(args: argparse.Namespace, model: Any) -> int:
+    """The observed tier of the colour-temperature range (docs/gamut.md section 11): the
+    pairs a transport gathered, judged per end, and each published end recorded on the
+    fixture's gamut where the end it holds came from a weaker tier."""
+    import json
+
+    from pascl.estimator.ct_observed import apply, observe
+    from pascl.model import dumps, validate, with_fixture_gamut
+
+    raw = json.loads(args.pairs.read_text(encoding="utf-8"))
+    rows = raw["pairs"] if isinstance(raw, dict) else raw
+    pairs = [(int(c), int(r)) for c, r in rows]
+    verdict = observe(pairs)
+    span = verdict.commanded_mired
+    print(
+        f"{args.fixture}: {verdict.pairs} pair(s)"
+        + (f", commanded {span[0]}-{span[1]} mired" if span else "")
+    )
+    for ev in (verdict.floor, verdict.ceiling):
+        if ev.published:
+            print(
+                f"  {ev.end}: {ev.kelvin} K ({ev.mired} mired) from {ev.support} pair(s), "
+                f"{ev.disagreeing} disagreeing, {ev.contradictions} contradicting"
+            )
+        else:
+            print(f"  {ev.end}: declined ({ev.verdict}): {ev.reason}")
+    held = _held_gamut(model, args.fixture)
+    if held is None:
+        print(f"{args.fixture}: no polygon on record; measure it first", file=sys.stderr)
+        return 1
+    updated, notes = apply(held, verdict)
+    for note in notes:
+        print(f"{args.fixture} note: {note}", file=sys.stderr)
+    if updated == held:
+        print(f"{args.fixture}: nothing recorded", file=sys.stderr)
+        return 0
+    candidate = with_fixture_gamut(model, args.fixture, updated)
+    problems = validate(candidate)
+    if problems:
+        for p in problems:
+            print(f"{args.fixture}: refused: {p}", file=sys.stderr)
+        return 1
+    print(
+        f"{args.fixture}: ct_range_k {updated.ct_range_k} ct_sources {updated.ct_sources}",
+        file=sys.stderr,
+    )
+    if args.write is not None:
+        args.write.write_text(dumps(candidate), encoding="utf-8")
+        print(f"written to {args.write}", file=sys.stderr)
+    return 0
 
 
 def _cmd_gamut_ids(args: argparse.Namespace, model: Any) -> int:
@@ -434,9 +518,8 @@ def _cmd_gamut_measure(args: argparse.Namespace, model: Any) -> int:
     command topic, or the light entity the host exposes), measured together in batches sized
     per coordinator or transport, the verdicts printed with every rule's fit, and the model
     written with the records (refusing any the model would not validate with)."""
-    from dataclasses import replace
 
-    from pascl.estimator.gamut import confirm_seed
+    from pascl.estimator.gamut import confirm_seed, with_measured_ct
     from pascl.harness.binding import expand, load_binding
     from pascl.model import dumps, validate, with_fixture_gamut
     from pascl.shell.airtime import measure_adaptively
@@ -522,12 +605,16 @@ def _cmd_gamut_measure(args: argparse.Namespace, model: Any) -> int:
             if args.ct_only:
                 print(f"{f}: ct_range_k {ct_text} answers {list(verdict.ct_answers)}")
                 held = _held_gamut(updated, f)
-                if ct is None or held is None:
-                    if held is None:
-                        print(f"{f}: no polygon on record; measure it first", file=sys.stderr)
+                if held is None:
+                    print(f"{f}: no polygon on record; measure it first", file=sys.stderr)
                     failed += 1
                     continue
-                candidate = with_fixture_gamut(updated, f, replace(held, ct_range_k=ct))
+                merged = with_measured_ct(held, verdict)
+                for d in verdict.ct_declined:
+                    print(f"{f} {d.tier} {d.end}: {d.verdict}: {d.reason}", file=sys.stderr)
+                if merged == held:
+                    continue
+                candidate = with_fixture_gamut(updated, f, merged)
                 problems = validate(candidate)
                 if problems:
                     for p in problems:
@@ -670,18 +757,27 @@ def _cmd_palette(args: argparse.Namespace) -> int:
             f"gap {c.gap:.0f} K  (range {c.ct_range_k[0]}-{c.ct_range_k[1]} K)  "
             f"{len(c.fixtures)} fixture(s): {', '.join(c.fixtures)}"
         )
+    questions = 0
     for cred in cct_credibility(model):
+        ends = " - ".join(
+            f"{'?' if v is None else v} K ({s or 'unknown'})"
+            for v, s in zip(cred.ct_range_k, cred.sources, strict=True)
+        )
         print(
-            f"ct range {cred.ct_range_k[0]}-{cred.ct_range_k[1]} K ({cred.source}) on "
-            f"{len(cred.fixtures)} fixture(s): {cred.note}: {', '.join(cred.fixtures)}",
+            f"ct range {ends} on {len(cred.fixtures)} fixture(s) of {cred.material}: {cred.note}: "
+            f"{', '.join(cred.fixtures)}",
             file=sys.stderr,
         )
+        if cred.question is not None:
+            questions += 1
+            print(f"QUESTION {questions}: {cred.question}", file=sys.stderr)
     measured = sum(
         1 for room in model.rooms.values() for fx in room.fixtures.values() if fx.gamut is not None
     )
     print(
         f"{len(rows)} unreachable palette colour(s) across {measured} fixture(s) with a gamut; "
-        f"{len(ct_rows)} colour temperature arc(s) parked at a white-only fixture's range",
+        f"{len(ct_rows)} colour temperature arc(s) parked at a white-only fixture's range; "
+        f"{questions} question(s) for the author",
         file=sys.stderr,
     )
     # A device clipping a colour the author chose is a surprise worth a non-zero exit; a

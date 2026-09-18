@@ -14,6 +14,7 @@ from pascl.model import (
     ModelError,
     dumps,
     fixture_cct_range,
+    fixture_cct_sources,
     fixture_clip,
     fixture_gamut,
     fixture_model_label,
@@ -78,6 +79,7 @@ def test_full_record_round_trips(raw: dict[str, Any]) -> None:
         "clip_rule": "toward_white",
         "firmware": "1.116.3",
         "ct_range_k": [2000, 6535],
+        "ct_sources": ["probed", "probed"],
     }
     _fixture(raw, "den", "den_pendant_2")["gamut"] = {
         "vertices": TRIANGLE,
@@ -86,6 +88,8 @@ def test_full_record_round_trips(raw: dict[str, Any]) -> None:
         "model_error": 0.0014,
         "clip_rule": "toward_white",
         "inherited_from": "den_pendant_1",
+        "ct_range_k": [2000, 20000],
+        "ct_sources": ["inherited", None],
     }
     model = from_dict(raw)
     assert validate(model) == []
@@ -98,6 +102,9 @@ def test_full_record_round_trips(raw: dict[str, Any]) -> None:
     assert to_dict(model)["home_model"]["rooms"]["den"]["fixtures"]["den_pendant_1"]["gamut"][
         "ct_range_k"
     ] == [2000, 6535]
+    assert to_dict(model)["home_model"]["rooms"]["den"]["fixtures"]["den_pendant_2"]["gamut"][
+        "ct_sources"
+    ] == ["inherited", None]
 
 
 def test_the_measured_ct_range_wins_over_the_declared_one(raw: dict[str, Any]) -> None:
@@ -106,16 +113,38 @@ def test_the_measured_ct_range_wins_over_the_declared_one(raw: dict[str, Any]) -
     _fixture(raw, "den", "den_pendant_1")["gamut"] = {
         "vertices": TRIANGLE,
         "ct_range_k": [2200, 6000],
+        "ct_sources": ["probed", "probed"],
     }
     model = from_dict(raw)
     assert validate(model) == []
     assert fixture_cct_range(model, "den_pendant_1") == (2200, 6000)
+    assert fixture_cct_sources(model, "den_pendant_1") == ("probed", "probed")
     assert fixture_cct_range(model, "den_pendant_2") == (2000, 6535)
-    assert fixture_cct_range(model, "den_strip") is None
-    assert fixture_cct_range(model, "no_such_fixture") is None
+    assert fixture_cct_sources(model, "den_pendant_2") == ("author", "author")
+    assert fixture_cct_range(model, "den_strip") == (None, None)
+    assert fixture_cct_range(model, "no_such_fixture") == (None, None)
     # a declared range must be ordered
     raw["home_model"]["materials"]["color_bulb"]["cct_range_k"] = [6535, 2000]
     assert any("min below max" in p for p in validate(from_dict(raw)))
+
+
+def test_each_ct_end_resolves_on_its_own(raw: dict[str, Any]) -> None:
+    """An observed floor with an unbounded ceiling: the floor is the gamut's, the ceiling
+    falls through to the material's declaration; with no declaration it is unknown."""
+    _fixture(raw, "den", "den_pendant_1")["gamut"] = {
+        "vertices": TRIANGLE,
+        "ct_range_k": [1996, 20000],
+        "ct_sources": ["observed", None],
+    }
+    model = from_dict(raw)
+    assert validate(model) == []
+    assert fixture_cct_range(model, "den_pendant_1") == (1996, 6535)
+    assert fixture_cct_sources(model, "den_pendant_1") == ("observed", "author")
+    raw["home_model"]["materials"]["color_bulb"].pop("cct_range_k")
+    bare = from_dict(raw)
+    assert fixture_cct_range(bare, "den_pendant_1") == (1996, None)
+    assert fixture_cct_sources(bare, "den_pendant_1") == ("observed", None)
+    assert fixture_cct_range(bare, "den_pendant_2") == (None, None)
 
 
 def test_gamut_is_strict(raw: dict[str, Any]) -> None:
@@ -145,6 +174,24 @@ QUAD = [[0.1532, 0.0475], [0.40, 0.12], [0.6915, 0.3083], [0.17, 0.70]]
         ({"vertices": TRIANGLE, "ct_range_k": [6535, 2000]}, "inside 1000-20000 K"),
         ({"vertices": TRIANGLE, "ct_range_k": [900, 6535]}, "inside 1000-20000 K"),
         ({"vertices": TRIANGLE, "ct_range_k": [2000, 20001]}, "inside 1000-20000 K"),
+        ({"vertices": TRIANGLE, "ct_range_k": [2000, 6535]}, "needs a source"),
+        ({"vertices": TRIANGLE, "ct_sources": ["probed", "probed"]}, "without a ct_range_k"),
+        (
+            {"vertices": TRIANGLE, "ct_range_k": [2000, 6535], "ct_sources": ["guessed", None]},
+            "expected one of",
+        ),
+        (
+            {"vertices": TRIANGLE, "ct_range_k": [2000, 6535], "ct_sources": ["probed"]},
+            "expected [floor_source, ceiling_source]",
+        ),
+        (
+            {"vertices": TRIANGLE, "ct_range_k": [2000, 6535], "ct_sources": [None, "probed"]},
+            "unbounded floor",
+        ),
+        (
+            {"vertices": TRIANGLE, "ct_range_k": [2000, 6535], "ct_sources": ["probed", None]},
+            "unbounded ceiling",
+        ),
     ],
 )
 def test_bad_gamuts_are_model_errors(
@@ -199,7 +246,11 @@ def test_gamut_needs_an_xy_material(raw: dict[str, Any]) -> None:
 
 
 def test_a_ct_range_needs_a_cct_material(raw: dict[str, Any]) -> None:
-    _fixture(raw, "den", "den_strip")["gamut"] = {"vertices": TRIANGLE, "ct_range_k": [2000, 6535]}
+    _fixture(raw, "den", "den_strip")["gamut"] = {
+        "vertices": TRIANGLE,
+        "ct_range_k": [2000, 6535],
+        "ct_sources": ["probed", "probed"],
+    }
     with pytest.raises(ModelError) as e:
         load(yaml.safe_dump(raw))
     assert any("without the cct capability" in msg for msg in e.value.errors)

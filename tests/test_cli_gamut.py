@@ -1,6 +1,7 @@
 """``pascl gamut`` and ``pascl palette check`` from the command line: the calibration state,
 the seeds, a measurement and the loop against a simulated host, and the palette report."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -228,3 +229,74 @@ def test_auto_once_measures_and_seeds(
         "fixtures"
     ]
     assert fixtures["den_pendant_2"]["gamut"]["inherited_from"] == "den_pendant_1"
+
+
+def test_observe_ct_records_a_floor_and_inherit_carries_it(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    raw = yaml.safe_load(DEMO.read_text(encoding="utf-8"))
+    fixtures = raw["home_model"]["rooms"]["den"]["fixtures"]
+    fixtures["den_pendant_1"]["gamut"] = {"vertices": TRIANGLE, "bound_to": "dev-1"}
+    fixtures["den_pendant_2"]["gamut"] = {"vertices": TRIANGLE, "bound_to": "dev-2"}
+    model = tmp_path / "home.yaml"
+    model.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    # a channel carrying the emitter: the arc past a 500-mired floor, reported clamped
+    pairs = tmp_path / "pairs.json"
+    rows = [[m, min(m, 500)] for m in range(300, 681, 4)]
+    pairs.write_text(json.dumps({"pairs": rows}), encoding="utf-8")
+    out = tmp_path / "observed.yaml"
+    assert (
+        main(
+            [
+                "gamut",
+                "observe-ct",
+                "--model",
+                str(model),
+                "--fixture",
+                "den_pendant_1",
+                "--pairs",
+                str(pairs),
+                "--write",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "floor: 2000 K (500 mired) from" in captured.out
+    assert "ceiling: declined (inconclusive): no clip observed at the ceiling" in captured.out
+    assert "ct_range_k (2000, 20000) ct_sources ('observed', None)" in captured.err
+    recorded = yaml.safe_load(out.read_text(encoding="utf-8"))
+    g = recorded["home_model"]["rooms"]["den"]["fixtures"]["den_pendant_1"]["gamut"]
+    assert g["ct_range_k"] == [2000, 20000] and g["ct_sources"] == ["observed", None]
+    # the sibling, measured on its own with nothing known about its range, inherits the end
+    seeded = tmp_path / "seeded.yaml"
+    assert main(["gamut", "inherit", "--model", str(out), "--write", str(seeded)]) == 0
+    captured = capsys.readouterr()
+    assert "ct floor den_pendant_2" in captured.out and "2000 K from den_pendant_1" in captured.out
+    assert "0 seed(s), 1 colour temperature end(s)" in captured.err
+    g2 = yaml.safe_load(seeded.read_text(encoding="utf-8"))["home_model"]["rooms"]["den"][
+        "fixtures"
+    ]["den_pendant_2"]["gamut"]
+    assert g2["ct_range_k"] == [2000, 20000] and g2["ct_sources"] == ["inherited", None]
+    # the echoing channel of the reference installation records nothing
+    echo = ROOT / "tests" / "fixtures" / "ct_pairs_echo.json"
+    assert (
+        main(
+            [
+                "gamut",
+                "observe-ct",
+                "--model",
+                str(model),
+                "--fixture",
+                "den_pendant_1",
+                "--pairs",
+                str(echo),
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "floor: declined (unobservable): the channel repeats the command" in captured.out
+    assert "ceiling: declined (unobservable)" in captured.out
+    assert "ct_range_k None ct_sources (None, None)" in captured.err

@@ -12,7 +12,7 @@ from pascl.core.color import blend_xy, oklab_to_xy, xy_to_oklab
 from pascl.core.palette import kelvin_xy, natural_white, natural_xy, static_index
 from pascl.core.render import FixtureState, RoomState, SolarState, ambient_factor, render_fixture
 from pascl.harness.preview import PreviewInputs, preview, scrub, solar_state
-from pascl.model import HomeModel, load
+from pascl.model import HomeModel, fixture_cct_range, load
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "demo_home.yaml"
 
@@ -178,13 +178,55 @@ def test_the_measured_ct_floor_overrides_the_declared_one(model: HomeModel) -> N
         )  # fmt: skip
 
     assert frame(model).mode == "ct"
-    high = with_fixture_gamut(model, "den_pendant_1", Gamut(poly, ct_range_k=(3500, 6500)))
+    high = with_fixture_gamut(
+        model,
+        "den_pendant_1",
+        Gamut(poly, ct_range_k=(3500, 6500), ct_sources=("probed", "probed")),
+    )
     assert frame(high).mode == "xy" and frame(high).ct_mired is None
-    low = with_fixture_gamut(model, "den_pendant_1", Gamut(poly, ct_range_k=(2000, 6500)))
+    low = with_fixture_gamut(
+        model,
+        "den_pendant_1",
+        Gamut(poly, ct_range_k=(2000, 6500), ct_sources=("probed", "probed")),
+    )
     assert frame(low).mode == "ct" and frame(low).ct_mired == 322
     # a polygon without a range changes nothing: the declaration stands
     bare = with_fixture_gamut(model, "den_pendant_1", Gamut(poly))
     assert frame(bare).mode == "ct"
+
+
+def test_an_unbounded_floor_takes_the_policy_of_its_siblings(model: HomeModel) -> None:
+    """No tier and no author: the render floors the white where the room's bounded
+    colour-temperature fixtures floor theirs (the highest known floor), else at the default;
+    the policy is labelled and never written into the fixture's range, and the author's word
+    replaces it."""
+    import yaml
+
+    from pascl.core.render import DEFAULT_MIN_KELVIN, cct_floor
+    from pascl.model import Gamut, from_dict, with_fixture_gamut
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["home_model"]["materials"]["color_bulb"].pop("cct_range_k")
+    bare = from_dict(raw)
+    poly = ((0.153185, 0.047547), (0.691493, 0.308293), (0.169986, 0.699992))
+    # nothing bounds anything in the den: the default, labelled policy
+    assert cct_floor(bare, "den", "den_pendant_1") == (DEFAULT_MIN_KELVIN, "policy")
+    # a probed sibling: its floor becomes the policy for the unbounded one
+    sibling = with_fixture_gamut(
+        bare, "den_pendant_2", Gamut(poly, ct_range_k=(2200, 6500), ct_sources=("probed", "probed"))
+    )
+    assert cct_floor(sibling, "den", "den_pendant_1") == (2200, "policy")
+    assert cct_floor(sibling, "den", "den_pendant_2") == (2200, "probed")
+    assert fixture_cct_range(sibling, "den_pendant_1") == (None, None)
+    # the author's word replaces the policy
+    assert cct_floor(model, "den", "den_pendant_1") == (2000, "author")
+    # and the render follows: at 2200 K the unbounded pendant renders the 2100 K white as xy
+    white = natural_white(NOON.progress, NOON.factor, NOON.pct)
+    f = render_fixture(
+        sibling, "den", "den_pendant_1", NOON, RoomState(), FixtureState(), white,
+        model.scenes.palettes["natural_white"],
+    )  # fmt: skip
+    assert f.mode in ("ct", "xy")
 
 
 def test_strip_never_takes_colour_temperature(model: HomeModel) -> None:

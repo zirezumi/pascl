@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, Literal
 
 from pascl.core.color import mired_to_kelvin
@@ -56,6 +56,8 @@ from pascl.model import (
     CREDIBLE_KELVIN,
     KELVIN_MAX,
     KELVIN_MIN,
+    CtDecline,
+    CtEnd,
     Gamut,
     HomeModel,
     with_fixture_gamut,
@@ -121,11 +123,12 @@ OUTLIER_FLOOR: Final = 0.005
 OUTLIER_FACTOR: Final = 10.0
 #: The colour temperatures commanded to check a device's range, in mireds, coolest first:
 #: past any real device's coolest (50 mired, 20000 K) and warmest (1000 mired, 1000 K). A
-#: device that clips its colour-temperature attribute answers its limits; a Hue bulb does not
-#: clip the attribute at all (it stores what it is sent, lit or dark, and the emitter clips
-#: physically), so the range comes from the limits the device DECLARES (``colorTempPhysicalMin``
-#: / ``Max``, read in one frame) and the probes only check them. Coolest first because a
-#: fixture at rest is far more often at its warm end.
+#: device that clips its colour-temperature attribute answers its limits (the first tier of
+#: docs/gamut.md section 11); a Hue bulb does not clip the attribute at all (it stores what it
+#: is sent, lit or dark, and the emitter clips physically where nothing on the wire reports
+#: it), so its range comes from the limits it DECLARES (``colorTempPhysicalMin`` / ``Max``,
+#: read in one frame) when those are credible, and the probes only check them. Coolest first
+#: because a fixture at rest is far more often at its warm end.
 CT_PROBES_MIRED: Final[tuple[int, int]] = (50, 1000)
 
 Kind = Literal["far", "vertex", "edge"]
@@ -177,6 +180,12 @@ class Verdict:
     ct_limits: tuple[int, int] | None = None
     """The limits the device declares (``colorTempPhysicalMin``, ``Max``; mireds, coolest
     first), the other half of the evidence; None when it did not answer."""
+    ct_source: ProbeCtSource | None = None
+    """Which of the two sources ``ct_range_k`` came from, ``probed`` or ``declared``; None
+    when declined."""
+    ct_declined: tuple[CtDecline, ...] = ()
+    """How the probed and declared tiers declined each end they did not bound
+    (:func:`ct_declines`): the proof that travels with an unbounded end."""
 
 
 def kelvin_range(mireds: tuple[int, int] | None) -> tuple[int, int] | None:
@@ -202,10 +211,21 @@ def credible(range_k: tuple[int, int] | None) -> bool:
     )
 
 
+ProbeCtSource = Literal["probed", "declared"]
+
+
 def ct_range_from(
     answers: Mapping[int, int | None], limits: tuple[int, int] | None = None
 ) -> tuple[int, int] | None:
-    """The device's colour-temperature range, kelvin (floor, ceiling).
+    """The range :func:`ct_range_source` finds, without its provenance."""
+    return ct_range_source(answers, limits)[0]
+
+
+def ct_range_source(
+    answers: Mapping[int, int | None], limits: tuple[int, int] | None = None
+) -> tuple[tuple[int, int] | None, ProbeCtSource | None]:
+    """The device's colour-temperature range, kelvin (floor, ceiling), with the tier that
+    produced it (``probed`` or ``declared``); (None, None) when declined.
 
     Two sources, the device's own both. ``limits`` is what the device declares as its
     physical limits (``colorTempPhysicalMin`` / ``Max``, mireds); ``answers`` are its answers
@@ -215,8 +235,9 @@ def ct_range_from(
     credible declared limits; else None. On the reference installation 63 of 85 fixtures
     declare 153-500 mired and the transport clamps commands to that, so their probes answer
     the limits; 22 declare 50-1000 mired (the attribute's whole span) and store any command,
-    so nothing about them is credible and the range is declined, for the author to declare
-    from the vendor's specification."""
+    so nothing here is credible and the range is declined, for the observed tier
+    (``pascl.estimator.ct_observed``), a sibling's end (``inherit_ct``) or the author's
+    declaration to fill."""
     cool_probe, warm_probe = CT_PROBES_MIRED
     coolest, warmest = answers.get(cool_probe), answers.get(warm_probe)
     probed: tuple[int, int] | None = None
@@ -228,11 +249,113 @@ def ct_range_from(
     ):
         probed = kelvin_range((coolest, warmest))
     if credible(probed):
-        return probed
+        return probed, "probed"
     declared = kelvin_range(limits)
     if credible(declared):
-        return declared
-    return None
+        return declared, "declared"
+    return None, None
+
+
+def ct_declines(
+    answers: Mapping[int, int | None], limits: tuple[int, int] | None = None
+) -> tuple[CtDecline, ...]:
+    """What the probed and declared tiers say about each end they did NOT bound
+    (:func:`ct_range_source`), as :class:`CtDecline` records with a verdict: ``unobservable``
+    when the evidence proves the tier can never bound that end on this device (a probe
+    answered with its own value, the attribute stores a command unclipped; a declaration that
+    is the attribute's whole span or otherwise not credible, the device's word is a
+    placeholder), ``inconclusive`` when the tier got no answer it could judge (a probe
+    unanswered or not applied, no limits read). Nothing for an end the tiers bounded."""
+    rng, source = ct_range_source(answers, limits)
+    out: list[CtDecline] = []
+    cool_probe, warm_probe = CT_PROBES_MIRED
+    ends: tuple[tuple[CtEnd, int], ...] = (("floor", warm_probe), ("ceiling", cool_probe))
+    for end, probe in ends:
+        if rng is not None and source == "probed":
+            continue
+        got = answers.get(probe)
+        if probe not in answers:
+            out.append(CtDecline("probed", end, "inconclusive", f"probe {probe} mired not taken"))
+        elif got is None:
+            out.append(
+                CtDecline(
+                    "probed", end, "inconclusive", f"probe {probe} mired unanswered or not applied"
+                )
+            )
+        elif got == probe:
+            out.append(
+                CtDecline(
+                    "probed",
+                    end,
+                    "unobservable",
+                    f"probe {probe} mired answered with its own value: the attribute stores a "
+                    "command unclipped",
+                )
+            )
+        else:
+            k = mired_to_kelvin(got)
+            out.append(
+                CtDecline(
+                    "probed",
+                    end,
+                    "inconclusive",
+                    f"probe {probe} mired answered {got} mired ({k} K), outside the credible band",
+                )
+            )
+        if rng is not None and source == "declared":
+            continue
+        declared = kelvin_range(limits)
+        if limits is None:
+            out.append(
+                CtDecline("declared", end, "inconclusive", "the limits read went unanswered")
+            )
+        elif declared is None:
+            out.append(
+                CtDecline(
+                    "declared",
+                    end,
+                    "unobservable",
+                    f"declares {limits[0]}-{limits[1]} mired, not a range",
+                )
+            )
+        else:
+            out.append(
+                CtDecline(
+                    "declared",
+                    end,
+                    "unobservable",
+                    f"declares {limits[0]}-{limits[1]} mired ({declared[0]}-{declared[1]} K), "
+                    "the attribute's span rather than its emitter",
+                )
+            )
+    return tuple(out)
+
+
+def with_measured_ct(held: Gamut, verdict: Verdict) -> Gamut:
+    """``held`` with a colour-temperature measurement folded in, tier by tier: a probed range
+    replaces both ends whatever they held (the device's own clipped attribute outranks every
+    other tier); a declared range fills an end that is unbounded, inherited or declared
+    (never one that is probed or observed); a declined measurement changes no end. The
+    verdict's probed and declared declines replace the held ones, the held observed declines
+    stay: each tier owns its own record."""
+    lo, hi = held.ct_range_k if held.ct_range_k is not None else (KELVIN_MIN, KELVIN_MAX)
+    lo_src, hi_src = held.ct_sources
+    if verdict.ct_range_k is not None and verdict.ct_source == "probed":
+        (lo, hi), lo_src, hi_src = verdict.ct_range_k, "probed", "probed"
+    elif verdict.ct_range_k is not None and verdict.ct_source == "declared":
+        if lo_src in (None, "inherited", "declared"):
+            lo, lo_src = verdict.ct_range_k[0], "declared"
+        if hi_src in (None, "inherited", "declared"):
+            hi, hi_src = verdict.ct_range_k[1], "declared"
+    declined = (
+        *verdict.ct_declined,
+        *(d for d in held.ct_declined if d.tier == "observed"),
+    )
+    if lo_src is None and hi_src is None:
+        return replace(held, ct_range_k=None, ct_sources=(None, None), ct_declined=declined)
+    if not lo < hi:
+        return replace(held, ct_declined=declined)
+    return replace(held, ct_range_k=(lo, hi), ct_sources=(lo_src, hi_src), ct_declined=declined)
 
 
 def is_echo(command: XY, reported: XY, tol: float = ECHO_TOL) -> bool:
@@ -723,8 +846,75 @@ def inherit(
                 inherited_from=seed.source,
                 firmware=None,
                 ct_range_k=src.ct_range_k,
+                ct_sources=(
+                    "inherited" if src.ct_sources[0] is not None else None,
+                    "inherited" if src.ct_sources[1] is not None else None,
+                ),
             ),
         )
+    return out, applied
+
+
+@dataclass(frozen=True)
+class CtSeed:
+    """A colour-temperature end copied from a fixture of the same model label."""
+
+    fixture: str
+    source: str
+    label: str
+    end: Literal["floor", "ceiling"]
+    kelvin: int
+
+
+def _ct_sources(model: HomeModel) -> dict[str, tuple[str, Gamut]]:
+    """label -> (fixture, gamut) of the first fixture per label whose colour-temperature
+    range carries a source of its own (probed, observed or declared) for at least one end."""
+    out: dict[str, tuple[str, Gamut]] = {}
+    for room in model.rooms.values():
+        for fid, fx in room.fixtures.items():
+            mat = model.materials.get(fx.material)
+            g = fx.gamut
+            if mat is None or mat.model is None or g is None or g.ct_range_k is None:
+                continue
+            if any(s is not None and s != "inherited" for s in g.ct_sources):
+                out.setdefault(mat.model, (fid, g))
+    return out
+
+
+def inherit_ct(model: HomeModel) -> tuple[HomeModel, list[CtSeed]]:
+    """The model with every unbounded colour-temperature end filled from a fixture of the
+    same model label whose own end has a source, recorded as ``inherited``. A polygon seed
+    copies the range with the polygon (``inherit``); this is for a fixture measured on its
+    own whose range still has an end no tier could speak for, and it never touches an end
+    that has a source of its own. Every unit of a model measures the same range, so the copy
+    is exact from its first minute and a later observation on the fixture itself replaces it
+    (``pascl.estimator.ct_observed.apply``)."""
+    sources = _ct_sources(model)
+    applied: list[CtSeed] = []
+    out = model
+    for room_id, room in model.rooms.items():
+        for fid, fx in room.fixtures.items():
+            mat = model.materials.get(fx.material)
+            g = fx.gamut
+            if mat is None or mat.model is None or g is None or mat.model not in sources:
+                continue
+            src_id, src = sources[mat.model]
+            if src_id == fid or src.ct_range_k is None:
+                continue
+            lo, hi = g.ct_range_k if g.ct_range_k is not None else (KELVIN_MIN, KELVIN_MAX)
+            lo_src, hi_src = g.ct_sources
+            changed = False
+            if lo_src is None and src.ct_sources[0] not in (None, "inherited"):
+                lo, lo_src, changed = src.ct_range_k[0], "inherited", True
+                applied.append(CtSeed(fid, src_id, mat.model, "floor", lo))
+            if hi_src is None and src.ct_sources[1] not in (None, "inherited"):
+                hi, hi_src, changed = src.ct_range_k[1], "inherited", True
+                applied.append(CtSeed(fid, src_id, mat.model, "ceiling", hi))
+            if changed and lo < hi:
+                out = with_fixture_gamut(
+                    out, fid, replace(g, ct_range_k=(lo, hi), ct_sources=(lo_src, hi_src))
+                )
+            del room_id
     return out, applied
 
 
@@ -734,6 +924,54 @@ def confirm_seed(seed: Gamut, measured: Polygon) -> tuple[bool, float]:
     two fixtures the author called the same hardware are not."""
     gap = vertex_deviation(seed.vertices, measured)
     return gap <= SEED_TOL, gap
+
+
+#: An author's declared end and a fixture's own probed or observed end further apart than this
+#: contradict each other; the comparators' kelvin band is of this order.
+AUTHOR_CT_TOL: Final = 50
+
+
+def ct_consistency(model: HomeModel) -> list[str]:
+    """Notes on the colour-temperature ranges: an author's declaration (``Material.cct_range_k``)
+    that a fixture's own probed or observed end contradicts by more than ``AUTHOR_CT_TOL``
+    (the observation stands for that fixture, the declaration is wrong for the label), and
+    two fixtures of one label whose own ends disagree by more than it. The colour-temperature
+    twin of :func:`consistency`: an author's word is falsifiable by design."""
+    notes: list[str] = []
+    own: dict[str, list[tuple[str, int, int | None, int | None]]] = {}
+    for room in model.rooms.values():
+        for fid, fx in room.fixtures.items():
+            mat = model.materials.get(fx.material)
+            if mat is None or fx.gamut is None or fx.gamut.ct_range_k is None:
+                continue
+            lo, hi = fx.gamut.ct_range_k
+            srcs = fx.gamut.ct_sources
+            lo_own = lo if srcs[0] in ("probed", "observed") else None
+            hi_own = hi if srcs[1] in ("probed", "observed") else None
+            if lo_own is None and hi_own is None:
+                continue
+            if mat.cct_range_k is not None:
+                for end, mine, theirs in (
+                    ("floor", lo_own, mat.cct_range_k[0]),
+                    ("ceiling", hi_own, mat.cct_range_k[1]),
+                ):
+                    if mine is not None and abs(mine - theirs) > AUTHOR_CT_TOL:
+                        notes.append(
+                            f"{fid}: its own {end} is {mine} K but material {fx.material} declares "
+                            f"{theirs} K; the declaration is contradicted"
+                        )
+            if mat.model is not None:
+                own.setdefault(mat.model, []).append((fid, lo_own or 0, lo_own, hi_own))
+    for label, rows in own.items():
+        first = rows[0]
+        for fid, _k, lo_own, hi_own in rows[1:]:
+            for end, mine, ref in (("floor", lo_own, first[2]), ("ceiling", hi_own, first[3])):
+                if mine is not None and ref is not None and abs(mine - ref) > AUTHOR_CT_TOL:
+                    notes.append(
+                        f"{fid} and {first[0]} carry the same label ({label}) but their own "
+                        f"{end}s are {mine} K and {ref} K"
+                    )
+    return notes
 
 
 def consistency(model: HomeModel) -> list[str]:

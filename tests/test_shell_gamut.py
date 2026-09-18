@@ -162,13 +162,14 @@ def test_measure_recovers_the_polygon_by_reading_back() -> None:
     assert not any("read-back" in n or "changing" in n for n in v.notes)
     assert dev.restored
     # the colour-temperature range came with it: 153 and 500 mired are 6535 and 2000 K
-    assert dev.ct_commands == 2 and v.ct_range_k == (2000, 6535)
+    assert dev.ct_commands == 2 and v.ct_range_k == (2000, 6535) and v.ct_source == "probed"
     assert v.ct_answers == ((50, 153), (1000, 500))
     g = gamut_from(v, dev, clock)
     assert g is not None and g.bound_to == "fake-device-1" and g.measured is not None
     assert g.vertices == v.polygon
     assert g.clip_rule == "closest" and g.firmware == "1.116.3" and g.inherited_from is None
     assert g.model_error == v.model_error and g.ct_range_k == (2000, 6535)
+    assert g.ct_sources == ("probed", "probed")
 
 
 def test_the_colour_temperature_range_has_its_own_switches_and_declines_honestly() -> None:
@@ -208,13 +209,15 @@ def test_a_hue_bulb_stores_the_command_unclipped_and_its_declared_limits_decide(
     v = measure(dev, clock=clock)
     assert v is not None and v.polygon is not None
     assert v.ct_answers == ((50, 50), (1000, 1000)) and v.ct_limits == (153, 500)
-    assert v.ct_range_k == (2000, 6535)
+    assert v.ct_range_k == (2000, 6535) and v.ct_source == "declared"
+    assert gamut_from(v, dev, clock).ct_sources == ("declared", "declared")  # type: ignore[union-attr]
     assert any(n.startswith(CT_STORED_UNCLIPPED) for n in v.notes)
     assert dev.lit_up == 0
     # the placeholder bulb: declines, naming the declaration, and never switches on for it
     dev = FakeDevice(clock, TRIANGLE, ct_range=None, ct_limits=(50, 1000))
     v = measure(dev, allow_lit=True, clock=clock)
     assert v is not None and v.ct_range_k is None and v.ct_limits == (50, 1000)
+    assert v.ct_source is None and gamut_from(v, dev, clock).ct_sources == (None, None)  # type: ignore[union-attr]
     assert any(
         n.startswith(CT_DECLINED) and "50-1000 mired" in n and "vendor" in n for n in v.notes
     )
@@ -222,7 +225,7 @@ def test_a_hue_bulb_stores_the_command_unclipped_and_its_declared_limits_decide(
     # credible probe answers win over the declared limits, with a note when they disagree
     dev = FakeDevice(clock, TRIANGLE, ct_range=(200, 454), ct_limits=(153, 500))
     v = measure(dev, clock=clock)
-    assert v is not None and v.ct_range_k == (2202, 5000)
+    assert v is not None and v.ct_range_k == (2202, 5000) and v.ct_source == "probed"
     assert any("disagree; the probes stand" in n for n in v.notes)
     # a lit fixture with credible limits is not probed (the probes would flash it)
     dev = FakeDevice(clock, TRIANGLE, lit=True, ct_range=None, ct_limits=(153, 500))

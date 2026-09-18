@@ -54,13 +54,15 @@ from pascl.core.gamut import XY
 from pascl.estimator.gamut import (
     CT_PROBES_MIRED,
     Probe,
+    ProbeCtSource,
     Verdict,
     credible,
-    ct_range_from,
+    ct_declines,
+    ct_range_source,
     is_echo,
     kelvin_range,
 )
-from pascl.model import Gamut
+from pascl.model import CtDecline, Gamut
 
 #: Seconds after the command before the first read-back: the device applies a zero transition
 #: within a Zigbee round trip, and every device tried answered a read in under 0.1 s.
@@ -397,24 +399,30 @@ def measure_ct(
     tuple[int, int] | None,
     tuple[str, ...],
     str | None,
+    ProbeCtSource | None,
+    tuple[CtDecline, ...],
 ]:
     """The colour-temperature range of the fixture on ``channel``: the limits it declares
     (one read) and the two probes in ``CT_PROBES_MIRED``, commanded and read back, a foreign
-    command retaking a sample once. Returns the range (``ct_range_from``, None when declined),
-    the probe answers, the declared limits, notes for the verdict, and the interruption that
-    cut it short, if one did (the caller restores at once; the fixture is not put back here).
+    command retaking a sample once. Returns the range (``ct_range_source``, None when
+    declined), the probe answers, the declared limits, notes for the verdict, the interruption
+    that cut it short, if one did (the caller restores at once; the fixture is not put back
+    here), the tier the range came from (``probed`` or ``declared``), and the declines of the
+    two tiers per end they did not bound (``ct_declines``).
     Runs after the polygon protocol, or on its own for a fixture whose polygon is already
     known.
 
     The probes are where a device that clips its attribute lands; a device that stores the
     command unclipped answers the probe's own value, lit or dark (every Hue bulb on the
     reference installation does), and its range is then its declared limits when those are
-    credible, nothing otherwise. A lit fixture whose limits are credible is not probed (the
-    probes would flash it for a check the dark case makes invisibly)."""
+    credible, nothing otherwise (the observed tier, ``pascl.estimator.ct_observed``, and the
+    author's declaration are the rest of the chain, docs/gamut.md section 11). A lit fixture
+    whose limits are credible is not probed (the probes would flash it for a check the dark
+    case makes invisibly)."""
     answers: dict[int, int | None] = {}
     notes: list[str] = []
     if abort_when is not None and (reason := abort_when()) is not None:
-        return None, (), None, (), reason
+        return None, (), None, (), reason, None, ()
     limits = read_ct_limits(channel, clock)
     declared = kelvin_range(limits)
     if limits is None:
@@ -422,7 +430,7 @@ def measure_ct(
     skip_probes = bool(lit) and credible(declared)
     for mired in () if skip_probes else CT_PROBES_MIRED:
         if abort_when is not None and (reason := abort_when()) is not None:
-            return None, tuple(answers.items()), limits, tuple(notes), reason
+            return None, tuple(answers.items()), limits, tuple(notes), reason, None, ()
         sample = take_ct_sample(channel, mired, clock, interrupt=not allow_lit)
         if on_sample is not None:
             on_sample(sample)
@@ -439,13 +447,14 @@ def measure_ct(
                 if sample.occupied and not sample.lit
                 else "fixture turned on during the measurement"
             )
-            return None, tuple(answers.items()), limits, tuple(notes), reason
+            return None, tuple(answers.items()), limits, tuple(notes), reason, None, ()
         answers[mired] = sample.mired
         if sample.mired is None:
             what = "not applied" if sample.unapplied else "unanswered"
             notes.append(f"colour temperature probe {mired} mired {what}")
         _wait(channel, clock, PAUSE)
-    rng = ct_range_from(answers, limits)
+    rng, source = ct_range_source(answers, limits)
+    declines = ct_declines(answers, limits)
     unclipped = bool(answers) and all(v == m for m, v in answers.items())
     if unclipped:
         notes.append(f"{CT_STORED_UNCLIPPED}: the probes answered their own values")
@@ -472,7 +481,7 @@ def measure_ct(
             f"the probes ({rng[0]}-{rng[1]} K) and the declared limits "
             f"({declared[0]}-{declared[1]} K) disagree; the probes stand"
         )
-    return rng, tuple(answers.items()), limits, tuple(notes), None
+    return rng, tuple(answers.items()), limits, tuple(notes), None, source, declines
 
 
 def measure(
@@ -529,6 +538,8 @@ def measure(
     ct_limits: tuple[int, int] | None = None
     ct_notes: tuple[str, ...] = ()
     cut: str | None = None
+    ct_source: ProbeCtSource | None = None
+    ct_declined: tuple[CtDecline, ...] = ()
     try:
         while xy and (step := pr.next()) is not None:
             if abort_when is not None and (aborted := abort_when()) is not None:
@@ -575,7 +586,7 @@ def measure(
                 previous = sample.xy
             _wait(channel, clk, PAUSE)
         if ct and aborted is None:
-            ct_range, ct_answers, ct_limits, ct_notes, cut = measure_ct(
+            ct_range, ct_answers, ct_limits, ct_notes, cut, ct_source, ct_declined = measure_ct(
                 channel,
                 clk,
                 allow_lit=allow_lit,
@@ -615,6 +626,8 @@ def measure(
             ct_range_k=ct_range,
             ct_answers=ct_answers,
             ct_limits=ct_limits,
+            ct_source=ct_source,
+            ct_declined=ct_declined,
         )
     return replace(
         verdict,
@@ -693,4 +706,6 @@ def gamut_from(
         inherited_from=None,
         firmware=channel.firmware,
         ct_range_k=verdict.ct_range_k,
+        ct_sources=(verdict.ct_source, verdict.ct_source),
+        ct_declined=verdict.ct_declined,
     )

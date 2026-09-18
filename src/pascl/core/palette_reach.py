@@ -27,11 +27,18 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Final
 
 from pascl.core.gamut import XY, ClipRule, Polygon, clip
 from pascl.core.palette import CCT_COOL_K, CCT_NIGHT_K, kelvin_xy
-from pascl.model import CREDIBLE_KELVIN, HomeModel, fixture_cct_range
+from pascl.model import (
+    CREDIBLE_KELVIN,
+    HomeModel,
+    fixture_cct_range,
+    fixture_cct_sources,
+    unobservable,
+    untried,
+)
 
 #: An entry further than this per axis from its clip is reported; below it the clip is
 #: within a transport's own rounding and no one could tell.
@@ -41,6 +48,13 @@ ARC_STEP_K: Final = 25.0
 #: The credible band (``pascl.model.CREDIBLE_KELVIN``): a range beyond it is a placeholder,
 #: and the render is floored at a number the device will clip.
 CREDIBLE_K: Final[tuple[int, int]] = CREDIBLE_KELVIN
+
+CctRange = tuple[int | None, int | None]
+"""(floor, ceiling) in kelvin as ``fixture_cct_range`` resolves them; a None end is one
+nothing speaks for."""
+CctSources = tuple[str | None, str | None]
+"""The provenance of each end, as ``fixture_cct_sources`` gives it (a tier name, ``author``
+for the material's declaration, None for an end nothing speaks for)."""
 
 
 @dataclass(frozen=True)
@@ -56,20 +70,29 @@ class CctUnreachable:
     gap: float
     """Kelvin between the two."""
     fixtures: tuple[str, ...]
-    ct_range_k: tuple[int, int]
-
-
-CctSource = Literal["measured", "declared"]
+    ct_range_k: CctRange
 
 
 @dataclass(frozen=True)
 class CctCredibility:
-    """A colour-temperature range that cannot be a physical device's."""
+    """A colour-temperature range a reader should look at: an end outside what a physical
+    device could have, an end no tier could speak for, or the author's slot holding a
+    transport's placeholder. ``question`` is set only for the one state in which the model
+    asks the author: an end every tier declined WITH PROOF (``unobservable``), where the
+    chain has shown that nothing on the wire can bound it."""
 
-    ct_range_k: tuple[int, int]
-    source: CctSource
+    ct_range_k: CctRange
+    sources: CctSources
     fixtures: tuple[str, ...]
     note: str
+    material: str = ""
+    question: str | None = None
+
+    @property
+    def source(self) -> str:
+        """The provenance in one word for a row: the floor's tier, else the ceiling's, else
+        ``unknown``."""
+        return self.sources[0] or self.sources[1] or "unknown"
 
 
 @dataclass(frozen=True)
@@ -158,22 +181,43 @@ def unreachable(model: HomeModel, min_gap: float = MIN_GAP) -> list[Unreachable]
     return out
 
 
-def _cct_groups(model: HomeModel) -> list[tuple[tuple[int, int], CctSource, bool, tuple[str, ...]]]:
-    """Every fixture with a colour-temperature range, grouped by (range, source, has xy)."""
-    keyed: dict[tuple[tuple[int, int], CctSource, bool], list[str]] = {}
+CctState = tuple[str, ...]
+"""Per fixture, how each unsourced end stands: ``unobservable`` (every tier declined it with
+proof), ``untried:<tiers>`` (a tier has not spoken with proof), or ``bounded``."""
+
+
+def _end_state(fx_gamut: object, i: int, srcs: CctSources) -> str:
+    from pascl.model import Gamut
+
+    g = fx_gamut if isinstance(fx_gamut, Gamut) else None
+    if srcs[i] is not None:
+        return "bounded"
+    if unobservable(g)[i]:
+        return "unobservable"
+    missing = untried(g)[i]
+    return "untried:" + ",".join(missing)
+
+
+def _cct_groups(
+    model: HomeModel,
+) -> list[tuple[CctRange, CctSources, bool, str, CctState, tuple[str, ...]]]:
+    """Every cct-capable fixture, grouped by (range, sources, has xy, material, the state of
+    each end)."""
+    keyed: dict[tuple[CctRange, CctSources, bool, str, CctState], list[str]] = {}
     for room in model.rooms.values():
         for fid, fx in room.fixtures.items():
             mat = model.materials.get(fx.material)
             if mat is None or "cct" not in mat.capabilities:
                 continue
             rng = fixture_cct_range(model, fid)
-            if rng is None:
-                continue
-            measured = fx.gamut is not None and fx.gamut.ct_range_k is not None
-            src: CctSource = "measured" if measured else "declared"
-            key = (rng, src, "xy" in mat.capabilities)
+            srcs = fixture_cct_sources(model, fid)
+            state = (_end_state(fx.gamut, 0, srcs), _end_state(fx.gamut, 1, srcs))
+            key = (rng, srcs, "xy" in mat.capabilities, fx.material, state)
             keyed.setdefault(key, []).append(fid)
-    return [(rng, src, has_xy, tuple(fids)) for (rng, src, has_xy), fids in keyed.items()]
+    return [
+        (rng, srcs, has_xy, material, state, tuple(fids))
+        for (rng, srcs, has_xy, material, state), fids in keyed.items()
+    ]
 
 
 def cct_unreachable(model: HomeModel) -> list[CctUnreachable]:
@@ -181,49 +225,109 @@ def cct_unreachable(model: HomeModel) -> list[CctUnreachable]:
     temperature only (``cct`` without ``xy``): the render floors a white at the range and
     such a fixture has no xy to fall back to, so the warmest night white and the coolest
     day white are shown at the range's ends instead. One row per palette and range, at the
-    worse of the two ends."""
+    worse of the two ends; an end nothing speaks for parks nothing."""
     out: list[CctUnreachable] = []
     for pid, pal in model.scenes.palettes.items():
         if pal.kind not in ("solar_cct", "solar_cct_offset"):
             continue
-        for rng, _src, has_xy, fids in _cct_groups(model):
+        for rng, _srcs, has_xy, _material, _state, fids in _cct_groups(model):
             if has_xy:
                 continue
             lo, hi = rng
-            below = lo - CCT_NIGHT_K if lo > CCT_NIGHT_K else 0.0
-            above = CCT_COOL_K - hi if hi < CCT_COOL_K else 0.0
+            below = lo - CCT_NIGHT_K if lo is not None and lo > CCT_NIGHT_K else 0.0
+            above = CCT_COOL_K - hi if hi is not None and hi < CCT_COOL_K else 0.0
             if below <= 0 and above <= 0:
                 continue
-            if below >= above:
+            if below >= above and lo is not None:
                 out.append(CctUnreachable(pid, CCT_NIGHT_K, lo, below, fids, rng))
-            else:
+            elif hi is not None:
                 out.append(CctUnreachable(pid, CCT_COOL_K, hi, above, fids, rng))
     out.sort(key=lambda u: (u.palette, -u.gap))
     return out
 
 
+def _end_note(
+    which: str, value: int | None, source: str | None, bound: int, state: str, *, below: bool
+) -> str | None:
+    if value is None:
+        if state == "unobservable":
+            return f"{which} unobservable: every tier declined it with proof"
+        tiers = state.split(":", 1)[1] if ":" in state else ""
+        return f"{which} not known yet: {tiers or 'a tier'} still to speak"
+    outside = value < bound if below else value > bound
+    if not outside:
+        return None
+    where = "below" if below else "above"
+    return f"{which} {value} K ({source}) is {where} {bound} K"
+
+
+def _proof(model: HomeModel, fids: tuple[str, ...]) -> str:
+    """The declines recorded on the first fixture of a group, as one line: the proof that
+    goes beside the question."""
+    for room in model.rooms.values():
+        for fid in fids:
+            fx = room.fixtures.get(fid)
+            if fx is not None and fx.gamut is not None and fx.gamut.ct_declined:
+                return "; ".join(f"{d.tier}: {d.reason}" for d in fx.gamut.ct_declined)
+    return ""
+
+
 def cct_credibility(model: HomeModel) -> list[CctCredibility]:
-    """Every colour-temperature range in force (measured, else declared) that lies outside
-    ``CREDIBLE_K``: the transport's placeholder, until the fixture is measured. A measured
-    range outside it is reported too, since the measurement then contradicts physics."""
+    """Every colour-temperature range in force with an end a reader should look at, one row
+    per (range, provenance, material, state):
+
+    - an end outside ``CREDIBLE_K`` from the author's slot: the transport's placeholder copied
+      into it, never a declaration (the author tier is never populated from a transport);
+      replace it with the vendor's value;
+    - an end outside ``CREDIBLE_K`` from a measurement: it contradicts physics, look at it;
+    - an end no tier could speak for, in one of two states that must never read alike
+      (DERIVED_PARAMETERS P2): UNOBSERVABLE, every tier declined it with proof, the one state
+      in which the row carries ``question``, the single thing the author is asked for, with
+      the proof beside it; or NOT KNOWN YET, a tier still to speak, which is a measurement
+      or an observation away, not a question for the author.
+
+    Each row names the ends' provenance, so probed, observed, declared, inherited and the
+    author's word read apart."""
     out: list[CctCredibility] = []
     lo_ok, hi_ok = CREDIBLE_K
-    for rng, src, _has_xy, fids in _cct_groups(model):
+    for rng, srcs, _has_xy, material, state, fids in _cct_groups(model):
         lo, hi = rng
-        problems = []
-        if lo < lo_ok:
-            problems.append(f"floor {lo} K is below {lo_ok} K")
-        if hi > hi_ok:
-            problems.append(f"ceiling {hi} K is above {hi_ok} K")
+        problems = [
+            n
+            for n in (
+                _end_note("floor", lo, srcs[0], lo_ok, state[0], below=True),
+                _end_note("ceiling", hi, srcs[1], hi_ok, state[1], below=False),
+            )
+            if n is not None
+        ]
         if not problems:
             continue
         what = "; ".join(problems)
-        how = (
-            "not credible for a physical emitter: measure it (the render floors the night "
-            "white at this range, and the device clips what it is sent)"
-            if src == "declared"
-            else "not credible for a physical emitter: the measurement wants a look"
-        )
-        out.append(CctCredibility(rng, src, fids, f"{what}; {how}"))
-    out.sort(key=lambda c: (c.source, c.ct_range_k))
+        question: str | None = None
+        if "unobservable" in state:
+            ends = " and ".join(
+                e for e, st in zip(("floor", "ceiling"), state, strict=True) if st == "unobservable"
+            )
+            question = (
+                f"what is the white range of material {material!r} (its {ends})? Nothing on this "
+                f"transport can bound it, so the model asks for exactly this, on the material "
+                f"(cct_range_k), labelled author; the render floors it at the policy floor until "
+                f"then. Proof: {_proof(model, fids)}"
+            )
+            how = "the chain declined with proof at every tier; see the question"
+        elif lo is None or hi is None:
+            how = (
+                "not a question for the author yet: measure it (pascl gamut measure --ct-only) "
+                "or gather its pairs (pascl gamut observe-ct) until every tier has spoken"
+            )
+        elif "author" in srcs:
+            how = (
+                f"the author's slot on material {material!r} holds a transport's placeholder, not "
+                "a declaration (the author tier is never populated from a transport); replace it "
+                "with the vendor's value, or measure the fixture"
+            )
+        else:
+            how = "not credible for a physical emitter: the measurement wants a look"
+        out.append(CctCredibility(rng, srcs, fids, f"{what}; {how}", material, question))
+    out.sort(key=lambda c: (c.source, c.ct_range_k[0] or 0, c.ct_range_k[1] or 0, c.material))
     return out

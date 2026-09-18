@@ -353,47 +353,137 @@ Section 9's estimator stays as a diagnostic of a transport's reporting, and as t
 an installation that chooses to trust reports; on the reference installation the arm is this
 section's, and the report interval and jitter describe the reports it no longer waits for.
 
-## 11. The colour-temperature range is measured too (`Gamut.ct_range_k`)
+## 11. The colour-temperature range is derived, tier by tier (`Gamut.ct_range_k`, `ct_sources`)
 
 A fixture that takes a colour temperature clips one outside its range exactly as it clips a
 chromaticity outside its polygon, and the range the host declares is what the device advertises,
-not what it does. On the reference installation 22 bulbs of one model advertise 1000-20000 K
+not what it does. On the reference installation 22 bulbs of one family advertise 1000-20000 K
 over a physical ~2000-6500 K; the render, flooring the night white at the declaration, sent them
-1475 K, the emitters showed 2000 K, and a comparator fed by a report of that would repaint them
-every 30 s all night. So the range is measured with the polygon, and the measurement has two
-sources, both the device's own (`measure_ct`):
+1475 K and the emitters showed 2000 K. So the range is DERIVED, like the polygon, and never
+looked up: each end is the answer of the first tier in an ordered chain of device evidence that
+can speak for it, and the tier is recorded with the value (`ct_sources`, one entry per end, P10
+of DERIVED_PARAMETERS). Every tier is the polygon's rule in one dimension, command past the end
+and observe where the device lands; what differs between tiers is only HOW the landing is
+observed, which is the transport's business, never what the value is.
 
-- the limits the device DECLARES, `colorTempPhysicalMin` / `Max`, read in one frame
-  (`read_ct_limits`; on a Zigbee2MQTT transport an attribute read answered into the device's
-  state, on a host entity its `min_color_temp_kelvin` / `max_color_temp_kelvin`);
-- two probes past any real device's ends (`CT_PROBES_MIRED`, 50 and 1000 mired, coolest first),
-  each commanded and read back under the polygon's timing rules (`take_ct_sample`): where a
-  device that clips its attribute lands.
+1. **Probed** (`probed`). `CT_PROBES_MIRED` (50 and 1000 mired, coolest first) commanded and
+   read back under the polygon's timing rules (`take_ct_sample`): a device that clips its
+   attribute answers its limits. On a Zigbee2MQTT transport the 63 bulbs declaring 153-500
+   mired answer exactly that, because the transport clamps commands to the declared limits
+   before sending; the answer is the transport's clamp of the device's declaration, and it
+   agrees with the declaration by construction.
+2. **Raw chromaticity under a colour-temperature command** (tested, declines on Hue, NOT
+   built). If a device's `currentX` / `currentY` attributes followed the emitter, a dark
+   `color_temp` command past the floor followed by an attribute read would give the floor's
+   chromaticity, invisibly, and a CCT from it. Live on an LCA014 (2026-09-17): 1000 mired
+   stored `(0.6528, 0.3445)`, the Planckian point of 1000 K; 50 mired stored `(0.2539,
+   0.2602)`, 20000 K's. The chromaticity attributes follow the STORED colour temperature, not
+   the emitter, so this tier has nothing to say on a Hue and is not implemented; it is recorded
+   here so no one measures it twice.
+3. **Observed** (`observed`, `pascl.estimator.ct_observed`). Any report channel that carries
+   the emitter's value (a native push that clamps, a bridge, a firmware that clamps the
+   attribute on the way out) yields (commanded, reported) pairs while the runtime does what it
+   does every night, command past the floor. The estimator takes the floor as the value the
+   device reports when commanded warmer than it, consistently, the ceiling likewise, and
+   declines per end as a first-class answer: no clip observed (the pairs cannot tell an
+   unexercised end from a channel that repeats the command, so the reason names the extreme
+   command the device repeated), too few clipped pairs (`MIN_SUPPORT`), clipped reports that
+   disagree (`SPREAD_TOL`), reports past the candidate (`CONTRADICTION_RATIO` of the support),
+   or a value outside `CREDIBLE_KELVIN`. Thresholds are ratios (P3), authority counts only
+   the pairs that show the clip (P7), a published end carries its support and its
+   contradictions. `pascl gamut observe-ct --pairs` records a published end on the gamut where
+   the end it holds came from a weaker tier (`ct_observed.apply`: a probed end stands, with a
+   note if they disagree). On the reference installation this tier DECLINES for the 22: the
+   attribute is stored unclipped and the native state push carries the same attribute, so
+   nine days of the night arc in the store (`tests/fixtures/ct_pairs_echo.json`, one bulb,
+   889 pairs to 676 mired) show every report repeating its command. That fixture is the
+   suite's real-data case (P8) and it must stay a decline.
+4. **Declared** (`declared`). The limits the device declares, `colorTempPhysicalMin` / `Max`,
+   read in one frame (`read_ct_limits`; on a host entity its `min_color_temp_kelvin` /
+   `max_color_temp_kelvin`), taken when credible (`CREDIBLE_KELVIN`, 1500-10000 K). A bulb
+   declaring 50-1000 mired has declared the attribute's whole span, not its emitter, and is
+   declined by name. A lit fixture whose limits are credible is not probed at all, since the
+   probes would flash it for a check the dark case makes invisibly.
+5. **Inherited** (`inherited`). An end no tier could speak for on this fixture, copied from a
+   fixture of the same model label whose own end has a source (`inherit_ct`; a polygon seed
+   copies the range with the polygon, `inherit`). Exact from its first minute, and the
+   fixture's own observation replaces it.
+6. **The author** (`author`, `Material.cct_range_k`). The last tier, outside the gamut record:
+   the material's declaration, the owner's word from a specification sheet, which
+   `fixture_cct_range` falls through to for an end nothing else bounds, labelled as such by
+   `fixture_cct_sources`. It is a first-class tier with four properties, because a product
+   that only measures has no honest state for "the transport proved this cannot be
+   observed" and a product that only declares launders placeholders:
+   - *Declared on the model label, not per fixture.* One line on the material, where a
+     product's UI would ask ("this bulb model's white range"), and every unit of the label
+     takes it, as polygon seeds do.
+   - *Labelled `author` at every consumer* (`fixture_cct_sources`, the render's
+     `cct_floor`, `pascl palette check`), so a reader can always tell it from `probed`,
+     `observed`, `declared` and `inherited` (P10).
+   - *Falsifiable.* A fixture's own probed or observed end outranks it the day a firmware or
+     a transport reports the emitter (`fixture_cct_range` resolves the gamut's end first),
+     and `ct_consistency` reports an author value a fixture's own end contradicts by more
+     than `AUTHOR_CT_TOL`, the way `confirm_seed` reports a polygon seed a measurement
+     contradicts.
+   - *Asked for only after the chain has proven unobservability, with the proof beside the
+     answer.* Every tier that declines an end records a `CtDecline` on the gamut (tier, end,
+     verdict, reason). The verdict is `unobservable` when the evidence proves the tier can
+     never bound that end on this device (a probe answered with its own value; a declaration
+     that is the attribute's whole span; a report channel that repeated a command past any
+     emitter's end, warmer than `CREDIBLE_KELVIN`'s floor), and `inconclusive` when the tier
+     got no answer it could judge (a probe unanswered, no limits read, an arc that never
+     reached the end, pairs too few or too noisy). An unsourced end is UNOBSERVABLE
+     (`unobservable`) only when every tier in `CT_TRIED_TIERS` declined it with proof; with a
+     tier untried or inconclusive it is NOT KNOWN YET (`untried` names the tiers), a
+     measurement or an observation away, never a question for the author. The two states
+     never read alike (P2). `pascl palette check` carries the question only in the first,
+     once per material, with the proof: "what is the white range of material X? Nothing on
+     this transport can bound it". The author tier is never populated from a transport: the
+     reference installation's private model once carried the device's 1000-20000 K
+     placeholder in the author's slot, and the check flags exactly that as a placeholder to
+     replace with the vendor's value, which is what was done.
 
-`ct_range_from` takes credible probe answers first (the device clipped there), else credible
-declared limits, else nothing; a range is credible inside `CREDIBLE_KELVIN` (1500-10000 K), and
-kelvin are truncated the way a host converts them so the range compares exactly with what the
-host reports. The evidence travels with the verdict (`ct_answers`, `ct_limits`) and the reasons
-for a decline are notes (`CT_DECLINED`, `CT_STORED_UNCLIPPED`).
+**The render's policy floor** (`cct_floor`, `pascl.core.render`). What a fresh install shows
+before the author answers matters: a room rendering mixed whites and ambers reads as broken. An
+unbounded floor therefore renders whites the way its co-rendered bounded siblings do, the highest
+known floor among the room's other colour-temperature fixtures, else `DEFAULT_MIN_KELVIN`
+(2000 K, the warmest white most tunable emitters reach). It is labelled `policy`, needs no author,
+is a render rule never written into the fixture's range, fails in the safe visible direction (a
+calibrated amber in xy rather than a colour temperature the device clips to a wrong white; the
+credible band's own floor, 1500 K, would fail the other way), and the author's value replaces it
+the moment it is declared. The 22 bulbs below are the case that motivated it.
 
-What the reference installation taught, in one evening: no Hue bulb clips the
-colour-temperature ATTRIBUTE. Lit or dark it stores what it is sent and answers a read with
-that (every one of 22 answered 50 and 1000 to the two probes, lit as well as dark), while the
-emitter clips physically and only a native state push says where. The 63 other bulbs declare
-153-500 mired and the transport clamps commands to the declared limits, so their probes answer
-the limits, which is the transport's clamp of the device's declaration, never the emitter. Hence
-the rule: the declaration is the device's word when it is credible, the probes are a check, and
-a bulb declaring 50-1000 mired (the attribute's whole span) is declined by name for the author
-to declare its range in the model from the vendor's specification (`Material.cct_range_k`,
-which `fixture_cct_range` falls back to, and which `pascl palette check` flags as not credible
-until it is). A lit fixture whose limits are credible is not probed at all, since the probes
-would flash it for a check the dark case makes invisibly.
+What the reference installation taught, in two evenings: no Hue bulb clips the colour-temperature
+ATTRIBUTE, lit or dark. It stores what it is sent and answers a read with that (every one of the
+22 answered 50 and 1000 to the two probes, lit as well as dark); its chromaticity attributes are
+the Planckian point of that stored value; and its native state push carries the stored value
+too. The emitter clips physically and nothing on the wire says where: on this transport the
+floor is unobservable, not merely unobserved, and that distinction is the product answer. For
+such a device the chain declines all the way to the author with proof at every tier, the
+question is asked once per model label, and the owner's answer (the vendor's 2000-6500 K,
+declared 2026-09-17) is carried as `author`, falsifiable, on the material. An earlier note in
+this file and in the estimator claimed the native push reported the clamped value (501 mired for
+a commanded 678); the store B pairs refute it and it is withdrawn.
 
-The range travels like the polygon (a seed copies it) and is consumed in two places: the render
-floors a white at the MEASURED range when the fixture has one, else the material's declaration,
-else 2000 K; and a comparator judges the device against the intent clipped to the range, as it
-judges chromaticity against the intent clipped to the polygon. A material without `cct` is never
-probed (the runtime passes `ct=False`); an interruption during the range stage keeps a polygon
-already measured and declines the range with a note, since the polygon's evidence is complete;
-and `pascl gamut measure --ct-only` measures the range alone, in seconds, for a fixture whose
-polygon is on record.
+`ct_range_source` (tiers 1 and 4, from one measurement) and `ct_observed.observe` (tier 3, from
+pairs) are the pure judges; `ct_declines` and `ct_observed.apply` write the declines;
+`measure_ct` runs the measurement and `Verdict.ct_source` / `Verdict.ct_declined` carry its
+tier and its declines; `gamut_from` writes them on a fresh gamut and `with_measured_ct` folds a
+later measurement into a held one tier by tier (a probed range replaces everything, a declared
+one fills only weaker ends, a declined one changes no end and records its declines beside the
+observed tier's). The model validates a range against its sources: an end with no source is
+unbounded and carries the span end (`KELVIN_MIN` / `KELVIN_MAX`), at least one end of a recorded
+range has a source, a tier never both supplies an end and declines it, and `fixture_cct_range`
+resolves each end on its own (gamut tier, else the material, else None). Consumers: the render
+floors a white at the resolved floor, else the policy floor; a comparator judges the device
+against the intent clipped to the resolved range, an unknown end clipping nothing, as it judges
+chromaticity against the intent clipped to the polygon. A material without `cct` is never probed (the runtime passes
+`ct=False`); an interruption during the range stage keeps a polygon already measured and declines
+the range with a note; `pascl gamut measure --ct-only` runs tiers 1 and 4 alone, in seconds, for
+a fixture whose polygon is on record.
+
+Two rules of DERIVED_PARAMETERS worth naming for this parameter. P6: the precision any tier needs
+is set by the consumers, a comparator's 50 K band and the render's floor decision, which the
+observed tier's ratio tolerances meet comfortably at 2000 K (1% of 500 mired is 20 K). P10:
+every published end carries its tier, so a reader of the model can always tell probed from
+observed from declared from inherited from the author's word.

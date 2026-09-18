@@ -211,3 +211,97 @@ def test_the_ct_range_is_the_device_answers_in_kelvin_or_nothing() -> None:
     assert ct_range_from({cool: 500, warm: 153}) is None
     assert ct_range_from({cool: 0, warm: 500}) is None
     assert ct_range_from({cool: 49, warm: 500}) is None  # 20408 K: past the band
+
+
+def test_ct_declines_name_the_tier_the_end_and_the_kind_of_decline() -> None:
+    from pascl.estimator.gamut import ct_declines
+
+    # a Hue placeholder bulb: both tiers declined both ends, with proof
+    rows = ct_declines({50: 50, 1000: 1000}, (50, 1000))
+    assert {(d.tier, d.end, d.verdict) for d in rows} == {
+        ("probed", "floor", "unobservable"),
+        ("probed", "ceiling", "unobservable"),
+        ("declared", "floor", "unobservable"),
+        ("declared", "ceiling", "unobservable"),
+    }
+    assert all("own value" in d.reason for d in rows if d.tier == "probed")
+    assert all("attribute's span" in d.reason for d in rows if d.tier == "declared")
+    # a bulb that answered nothing and declared nothing: inconclusive, try again
+    rows = ct_declines({50: None, 1000: None}, None)
+    assert all(d.verdict == "inconclusive" for d in rows) and len(rows) == 4
+    # a bulb whose probes clipped: nothing declined
+    assert ct_declines({50: 153, 1000: 500}, (153, 500)) == ()
+    # declared limits credible, probes own values: only the probed tier declined
+    rows = ct_declines({50: 50, 1000: 1000}, (153, 500))
+    assert {d.tier for d in rows} == {"probed"} and len(rows) == 2
+
+
+def test_with_measured_ct_folds_a_measurement_in_tier_by_tier() -> None:
+    from dataclasses import replace
+
+    from pascl.estimator.gamut import Verdict, ct_declines, with_measured_ct
+    from pascl.model import CtDecline, Gamut
+
+    tri = ((0.7, 0.3), (0.2, 0.7), (0.15, 0.05))
+    base = Verdict(polygon=tri, model_error=None, device_reports=0, unanswered=0, notes=())
+    observed = Gamut(
+        tri,
+        ct_range_k=(1996, 20000),
+        ct_sources=("observed", None),
+        ct_declined=(CtDecline("observed", "ceiling", "inconclusive", "not reached"),),
+    )
+    # a probed range replaces everything
+    probed = replace(base, ct_range_k=(2000, 6535), ct_source="probed")
+    g = with_measured_ct(observed, probed)
+    assert g.ct_range_k == (2000, 6535) and g.ct_sources == ("probed", "probed")
+    assert [d.tier for d in g.ct_declined] == ["observed"]
+    # a declared range fills only weaker ends
+    declared = replace(base, ct_range_k=(2000, 6535), ct_source="declared")
+    g = with_measured_ct(observed, declared)
+    assert g.ct_range_k == (1996, 6535) and g.ct_sources == ("observed", "declared")
+    # a declined measurement changes no end and records its declines beside the observed one
+    declined = replace(base, ct_declined=ct_declines({50: 50, 1000: 1000}, (50, 1000)))
+    g = with_measured_ct(observed, declined)
+    assert g.ct_range_k == observed.ct_range_k and g.ct_sources == observed.ct_sources
+    assert {d.tier for d in g.ct_declined} == {"probed", "declared", "observed"}
+    g = with_measured_ct(Gamut(tri), declined)
+    assert g.ct_range_k is None and len(g.ct_declined) == 4
+
+
+def test_ct_consistency_reports_an_authors_word_that_observation_contradicts() -> None:
+    from pathlib import Path
+
+    from pascl.estimator.gamut import ct_consistency
+    from pascl.model import Gamut, load, with_fixture_gamut
+
+    example = Path(__file__).resolve().parents[1] / "examples" / "demo_home.yaml"
+    model = load(example.read_text(encoding="utf-8"))  # colour bulbs declare 2000-6535 K
+    tri = ((0.7, 0.3), (0.2, 0.7), (0.15, 0.05))
+    agreeing = with_fixture_gamut(
+        model,
+        "den_pendant_1",
+        Gamut(tri, ct_range_k=(2010, 6535), ct_sources=("observed", "probed")),
+    )
+    assert ct_consistency(agreeing) == []
+    contradicted = with_fixture_gamut(
+        model,
+        "den_pendant_1",
+        Gamut(tri, ct_range_k=(2200, 6535), ct_sources=("observed", "probed")),
+    )
+    notes = ct_consistency(contradicted)
+    assert len(notes) == 1 and "declares 2000 K; the declaration is contradicted" in notes[0]
+    # two units of one label whose own floors disagree
+    both = with_fixture_gamut(
+        contradicted,
+        "den_pendant_2",
+        Gamut(tri, ct_range_k=(2000, 6535), ct_sources=("probed", "probed")),
+    )
+    notes = ct_consistency(both)
+    assert any("same label" in n and "2000 K and 2200 K" in n for n in notes)
+    # an inherited or declared end is never a contradiction of its own source
+    seeded = with_fixture_gamut(
+        model,
+        "den_pendant_1",
+        Gamut(tri, ct_range_k=(2200, 6535), ct_sources=("inherited", "declared")),
+    )
+    assert ct_consistency(seeded) == []

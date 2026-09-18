@@ -98,6 +98,42 @@ CREDIBLE_KELVIN = (1500, 10000)
 ~1700 K or above ~9000 K. A range beyond this is a placeholder (a bulb declaring the whole
 Zigbee attribute range as its physical limits), not a measurement."""
 
+CtSource = Literal["probed", "observed", "declared", "inherited"]
+CT_SOURCES: tuple[CtSource, ...] = get_args(CtSource)
+CtTier = Literal["probed", "observed", "declared"]
+CT_TRIED_TIERS: tuple[CtTier, ...] = get_args(CtTier)
+"""The tiers a fixture's own evidence can decline (inheritance and the author's word are not
+tried on the device); all three declined with proof is what makes an end unobservable."""
+CtEnd = Literal["floor", "ceiling"]
+CtVerdict = Literal["unobservable", "inconclusive"]
+CT_VERDICTS: tuple[CtVerdict, ...] = get_args(CtVerdict)
+"""How a tier declined an end: ``unobservable``, the evidence proves this tier can never
+bound the end on this device (the attribute stores a command unclipped, the declaration is
+the attribute's whole span, the report channel repeated a command past any emitter's
+floor); ``inconclusive``, the tier did not get an answer it could judge (no reply, too few
+pairs, an end the commands never reached), so trying again may still speak."""
+
+
+@dataclass(frozen=True)
+class CtDecline:
+    """One tier's decline of one end of a fixture's colour-temperature range, with the
+    reason: the proof that stays beside an unbounded end (DERIVED_PARAMETERS P2, P10)."""
+
+    tier: CtTier
+    end: CtEnd
+    verdict: CtVerdict
+    reason: str
+
+
+"""Where one end of a fixture's colour-temperature range came from, in the order the chain
+tries them (docs/gamut.md section 11): ``probed``, the device was commanded past the end and
+its attribute clipped, answering the limit; ``observed``, the device reported the clip in use
+(from commanded/reported pairs, ``pascl.estimator.ct_observed``); ``declared``, the device's
+own credible declaration; ``inherited``, copied from a measured fixture of the same model
+label. An end with no source is UNBOUNDED: no tier could speak, the value carried is the
+attribute's span end (``KELVIN_MIN`` / ``KELVIN_MAX``), and :func:`fixture_cct_range` falls
+through to the material's declaration (the author's word, the last tier) or to nothing."""
+
 
 class ModelError(ValueError):
     """The model could not be loaded or does not validate. ``errors`` lists every problem."""
@@ -194,12 +230,23 @@ class Gamut:
     """The device's firmware at measurement, as the transport reported it. Information for a
     reader comparing units, never a staleness trigger: a gamut does not drift."""
     ct_range_k: tuple[int, int] | None = None
-    """The colour temperatures the device can actually show, kelvin, (floor, ceiling), measured
-    the way the polygon is: commanded past each end and read back. A transport's declared range
-    is what the device advertises, and the reference installation found 22 bulbs advertising
-    1000-20000 K over a physical 2000-6535 K; a comparator judging the device against a
-    declared range repaints such a bulb forever at night. None when unmeasured, in which case
-    :func:`fixture_cct_range` falls back to the material's declaration."""
+    """The colour temperatures the device can actually show, kelvin, (floor, ceiling), each end
+    from the first tier of the chain that could speak for it (``ct_sources``). A transport's
+    declared range is what the device advertises, and the reference installation found 22
+    bulbs advertising 1000-20000 K over a physical ~2000-6500 K; a comparator judging the
+    device against a declared range repaints such a bulb forever at night. None when no tier
+    spoke for either end, in which case :func:`fixture_cct_range` falls back to the material's
+    declaration; an end whose source is None is unbounded and carries the span end."""
+    ct_sources: tuple[CtSource | None, CtSource | None] = (None, None)
+    """The tier that produced each end of ``ct_range_k`` (floor, ceiling); None for an end no
+    tier could speak for. (None, None) when there is no range."""
+    ct_declined: tuple[CtDecline, ...] = ()
+    """The tiers tried on this fixture that declined an end, each with its verdict and reason:
+    the proof that stays beside an unbounded end. An end with no source that every tier in
+    ``CT_TRIED_TIERS`` declined as ``unobservable`` is UNOBSERVABLE on this transport
+    (:func:`unobservable`), the one state in which the model may ask the author for the
+    range; an end with no source and a tier missing or ``inconclusive`` here is merely not
+    known yet. The two must never read alike (DERIVED_PARAMETERS P2)."""
 
 
 @dataclass(frozen=True)
@@ -509,6 +556,8 @@ _GAMUT = (
     "inherited_from",
     "firmware",
     "ct_range_k",
+    "ct_sources",
+    "ct_declined",
 )
 _GROUP = ("members", "tier", "transport", "address")
 _PRESENCE = ("sources", "fusion", "pir", "coalesce_ms")
@@ -643,6 +692,43 @@ def _read_kelvin_range(r: _Reader, ctx: str, rng: object) -> tuple[int, int] | N
     return None
 
 
+def _read_ct_sources(r: _Reader, ctx: str, v: object) -> tuple[CtSource | None, CtSource | None]:
+    """``[floor_source, ceiling_source]``, each a member of ``CT_SOURCES`` or null; (None, None)
+    when absent."""
+    if v is None:
+        return (None, None)
+    if isinstance(v, list) and len(v) == 2:
+        out: list[CtSource | None] = []
+        for i, s in enumerate(v):
+            out.append(None if s is None else r.literal(f"{ctx}[{i}]", s, CT_SOURCES, "probed"))
+        return (out[0], out[1])
+    r.fail(ctx, f"expected [floor_source, ceiling_source], got {v!r}")
+    return (None, None)
+
+
+def _read_ct_declined(r: _Reader, ctx: str, v: object) -> tuple[CtDecline, ...]:
+    """``[[tier, end, verdict, reason], ...]``; () when absent."""
+    if v is None:
+        return ()
+    if not isinstance(v, list):
+        r.fail(ctx, f"expected a list of [tier, end, verdict, reason] rows, got {v!r}")
+        return ()
+    out: list[CtDecline] = []
+    for i, item in enumerate(v):
+        if not (isinstance(item, list) and len(item) == 4 and isinstance(item[3], str) and item[3]):
+            r.fail(f"{ctx}[{i}]", f"expected [tier, end, verdict, reason], got {item!r}")
+            continue
+        out.append(
+            CtDecline(
+                tier=r.literal(f"{ctx}[{i}][0]", item[0], CT_TRIED_TIERS, "probed"),
+                end=r.literal(f"{ctx}[{i}][1]", item[1], ("floor", "ceiling"), "floor"),
+                verdict=r.literal(f"{ctx}[{i}][2]", item[2], CT_VERDICTS, "inconclusive"),
+                reason=item[3],
+            )
+        )
+    return tuple(out)
+
+
 def _read_sensor(r: _Reader, ctx: str, v: object) -> Sensor:
     d = r.mapping(ctx, v, _SENSOR)
     return Sensor(
@@ -671,6 +757,8 @@ def _read_gamut(r: _Reader, ctx: str, v: object) -> Gamut:
         inherited_from=r.string(f"{ctx}.inherited_from", d.get("inherited_from")),
         firmware=r.string(f"{ctx}.firmware", d.get("firmware")),
         ct_range_k=_read_kelvin_range(r, f"{ctx}.ct_range_k", d.get("ct_range_k")),
+        ct_sources=_read_ct_sources(r, f"{ctx}.ct_sources", d.get("ct_sources")),
+        ct_declined=_read_ct_declined(r, f"{ctx}.ct_declined", d.get("ct_declined")),
     )
 
 
@@ -1012,6 +1100,7 @@ def validate(m: HomeModel) -> list[str]:
                     f"{fctx}.gamut: rgb_clamp is a rule for a three-primary (triangle) gamut",
                 )
                 ct = fx.gamut.ct_range_k
+                ct_src = fx.gamut.ct_sources
                 check(
                     ct is None or KELVIN_MIN <= ct[0] < ct[1] <= KELVIN_MAX,
                     f"{fctx}.gamut: ct_range_k must be (floor, ceiling) inside "
@@ -1021,6 +1110,35 @@ def validate(m: HomeModel) -> list[str]:
                     ct is None or fx_mat is None or "cct" in fx_mat.capabilities,
                     f"{fctx}.gamut: a ct_range_k on a material without the cct capability",
                 )
+                check(
+                    ct is not None or ct_src == (None, None),
+                    f"{fctx}.gamut: ct_sources without a ct_range_k",
+                )
+                check(
+                    ct is None or ct_src[0] is not None or ct_src[1] is not None,
+                    f"{fctx}.gamut: a ct_range_k needs a source for at least one end "
+                    "(ct_sources); an end no tier spoke for is unbounded",
+                )
+                check(
+                    ct is None or ct_src[0] is not None or ct[0] == KELVIN_MIN,
+                    f"{fctx}.gamut: an unbounded floor (no source) carries {KELVIN_MIN} K",
+                )
+                check(
+                    ct is None or ct_src[1] is not None or ct[1] == KELVIN_MAX,
+                    f"{fctx}.gamut: an unbounded ceiling (no source) carries {KELVIN_MAX} K",
+                )
+                keys = [(d.tier, d.end) for d in fx.gamut.ct_declined]
+                check(
+                    len(keys) == len(set(keys)),
+                    f"{fctx}.gamut: ct_declined names a (tier, end) twice",
+                )
+                for i, end in enumerate(("floor", "ceiling")):
+                    end_src = ct_src[i]
+                    check(
+                        end_src is None or end_src == "inherited" or (end_src, end) not in keys,
+                        f"{fctx}.gamut: the {end} came from the {end_src} tier, which ct_declined "
+                        "also says declined it",
+                    )
                 seed_id = fx.gamut.inherited_from
                 if seed_id is not None:
                     seed_fx = _find_fixture(m, seed_id)
@@ -1315,6 +1433,19 @@ def to_dict(m: HomeModel) -> dict[str, Any]:
                                 "ct_range_k": (
                                     None if f.gamut.ct_range_k is None else list(f.gamut.ct_range_k)
                                 ),
+                                "ct_sources": (
+                                    None
+                                    if f.gamut.ct_sources == (None, None)
+                                    else list(f.gamut.ct_sources)
+                                ),
+                                "ct_declined": (
+                                    None
+                                    if not f.gamut.ct_declined
+                                    else [
+                                        [d.tier, d.end, d.verdict, d.reason]
+                                        for d in f.gamut.ct_declined
+                                    ]
+                                ),
                             }
                         }
                     ),
@@ -1484,18 +1615,81 @@ def fixture_gamut(m: HomeModel, fixture_id: str) -> tuple[XY, ...]:
     return () if fx is None or fx.gamut is None else fx.gamut.vertices
 
 
-def fixture_cct_range(m: HomeModel, fixture_id: str) -> tuple[int, int] | None:
-    """The colour temperatures a fixture can show, kelvin (floor, ceiling): measured with its
-    gamut when it has been, else what its material declares, else None (a fixture without
-    ``cct``, or unknown). What the render floors a colour temperature at and what a
-    comparator clips the intent to before judging the device."""
+CctEndSource = Literal["probed", "observed", "declared", "inherited", "author"]
+"""A resolved end's provenance: a ``CtSource`` from the fixture's gamut, or ``author`` when the
+material's declaration supplied it."""
+
+
+def fixture_cct_range(m: HomeModel, fixture_id: str) -> tuple[int | None, int | None]:
+    """The colour temperatures a fixture can show, kelvin (floor, ceiling), each end resolved
+    on its own: the gamut's end when a tier spoke for it (``Gamut.ct_sources``), else the
+    material's declaration (the author's word), else None, meaning nothing is known about
+    that end. What the render floors a colour temperature at (a None floor leaves the render
+    its default) and what a comparator clips the intent to before judging the device (a None
+    end clips nothing). (None, None) for a fixture without ``cct``, or unknown."""
+    (floor_k, _), (ceiling_k, _) = _cct_ends(m, fixture_id)
+    return (floor_k, ceiling_k)
+
+
+def unobservable(gamut: Gamut | None) -> tuple[bool, bool]:
+    """Per end (floor, ceiling): whether nothing on this transport can bound it: the end has
+    no source and every tier in ``CT_TRIED_TIERS`` declined it as ``unobservable``. An end
+    with a source is bounded; an unsourced end with a tier untried or inconclusive is not
+    known yet either way. The only state in which asking the author for the range is
+    justified."""
+    if gamut is None:
+        return (False, False)
+
+    def proven(i: int, end: str) -> bool:
+        if gamut.ct_sources[i] is not None:
+            return False
+        shown = {d.tier for d in gamut.ct_declined if d.end == end and d.verdict == "unobservable"}
+        return all(t in shown for t in CT_TRIED_TIERS)
+
+    return (proven(0, "floor"), proven(1, "ceiling"))
+
+
+def untried(gamut: Gamut | None) -> tuple[tuple[CtTier, ...], tuple[CtTier, ...]]:
+    """Per end: the tiers that have not yet spoken with proof (never tried, or inconclusive),
+    for a reader deciding what to try next. Empty for a sourced end."""
+    if gamut is None:
+        return (CT_TRIED_TIERS, CT_TRIED_TIERS)
+    out: list[tuple[CtTier, ...]] = []
+    for i, end in enumerate(("floor", "ceiling")):
+        if gamut.ct_sources[i] is not None:
+            out.append(())
+            continue
+        shown = {d.tier for d in gamut.ct_declined if d.end == end and d.verdict == "unobservable"}
+        out.append(tuple(t for t in CT_TRIED_TIERS if t not in shown))
+    return (out[0], out[1])
+
+
+def fixture_cct_sources(
+    m: HomeModel, fixture_id: str
+) -> tuple[CctEndSource | None, CctEndSource | None]:
+    """Where each end of :func:`fixture_cct_range` came from: the gamut's tier, ``author``
+    for the material's declaration, None for an end nothing speaks for."""
+    (_, floor_src), (_, ceiling_src) = _cct_ends(m, fixture_id)
+    return (floor_src, ceiling_src)
+
+
+def _cct_ends(
+    m: HomeModel, fixture_id: str
+) -> tuple[tuple[int | None, CctEndSource | None], tuple[int | None, CctEndSource | None]]:
     fx = _find_fixture(m, fixture_id)
     if fx is None:
-        return None
-    if fx.gamut is not None and fx.gamut.ct_range_k is not None:
-        return fx.gamut.ct_range_k
+        return ((None, None), (None, None))
     mat = m.materials.get(fx.material)
-    return None if mat is None else mat.cct_range_k
+    declared = None if mat is None else mat.cct_range_k
+    out: list[tuple[int | None, CctEndSource | None]] = []
+    for i in (0, 1):
+        if fx.gamut is not None and fx.gamut.ct_range_k is not None and fx.gamut.ct_sources[i]:
+            out.append((fx.gamut.ct_range_k[i], fx.gamut.ct_sources[i]))
+        elif declared is not None:
+            out.append((declared[i], "author"))
+        else:
+            out.append((None, None))
+    return (out[0], out[1])
 
 
 def fixture_clip(m: HomeModel, fixture_id: str) -> tuple[tuple[XY, ...], ClipRule]:
