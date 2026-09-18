@@ -52,7 +52,10 @@ or in names. The version bumps on any breaking change.
   phases per zone out (entering, occupied, fading, vacant, with time-in-phase). Probability never
   reaches the render. Time enters only through the injected clock.
 - **The impure shell** (`pascl.shell`): transports, the scheduler, the reconciler, the event seam,
-  persistence. The only layer that owns the real clock or touches a network.
+  persistence. The only layer that owns the real clock or touches a network. It is also where a
+  host's presentation is undone: a level comes back in the device's units (`levels.md`), a colour
+  is judged against what the device can reach (`gamut.md`), so nothing above the shell compares
+  two scales.
 
 `pascl.clock` is the seam. `tests/test_purity.py` reads the source of the first two layers and
 fails the build on any import, call or name that would let wall time, randomness, I/O or a lower

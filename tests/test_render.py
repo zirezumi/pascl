@@ -162,6 +162,31 @@ def test_bulb_on_the_white_arc_renders_as_colour_temperature(model: HomeModel) -
     assert natural_xy(white, calib) == calib.cool_xy
 
 
+def test_the_measured_ct_floor_overrides_the_declared_one(model: HomeModel) -> None:
+    """The demo's colour bulb declares a 2000 K floor, so a 3100 K noon white is a colour
+    temperature; measured with a floor above that, the same white renders as xy, and a
+    measured floor below the declaration lets a white the declaration refused through."""
+    from pascl.model import Gamut, with_fixture_gamut
+
+    white = natural_white(NOON.progress, NOON.factor, NOON.pct)
+    poly = ((0.153185, 0.047547), (0.691493, 0.308293), (0.169986, 0.699992))
+
+    def frame(m: HomeModel):  # type: ignore[no-untyped-def]
+        return render_fixture(
+            m, "den", "den_pendant_1", NOON, RoomState(), FixtureState(), white,
+            model.scenes.palettes["natural_white"],
+        )  # fmt: skip
+
+    assert frame(model).mode == "ct"
+    high = with_fixture_gamut(model, "den_pendant_1", Gamut(poly, ct_range_k=(3500, 6500)))
+    assert frame(high).mode == "xy" and frame(high).ct_mired is None
+    low = with_fixture_gamut(model, "den_pendant_1", Gamut(poly, ct_range_k=(2000, 6500)))
+    assert frame(low).mode == "ct" and frame(low).ct_mired == 322
+    # a polygon without a range changes nothing: the declaration stands
+    bare = with_fixture_gamut(model, "den_pendant_1", Gamut(poly))
+    assert frame(bare).mode == "ct"
+
+
 def test_strip_never_takes_colour_temperature(model: HomeModel) -> None:
     white = natural_white(NOON.progress, NOON.factor, NOON.pct)
     f = render_fixture(

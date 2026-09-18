@@ -55,6 +55,7 @@ class FakeDevice:
         lit: bool = False,
         foreign_at: int | None = None,
         lit_at: int | None = None,
+        ct_range: tuple[int, int] | None = (153, 500),
     ) -> None:
         self.clock = clock
         self.poly = poly
@@ -64,16 +65,30 @@ class FakeDevice:
         self.lit_at = lit_at
         self.pending: list[tuple[float, Observation]] = []
         self.commands = 0
+        self.ct_commands = 0
         self.reads = 0
         self.restored = False
         self.lit_up = 0
         self.current: XY = (0.4, 0.4)
+        # the hidden colour-temperature range, mireds (coolest, warmest); None: no such thing,
+        # a colour temperature is ignored and a read answers the resting value
+        self.ct_range = ct_range
+        self.current_ct = 370
+        self.ct_in_flight = False
 
     def is_lit(self) -> bool | None:
         return self.lit
 
+    def command_ct(self, mired: int) -> None:
+        self.ct_commands += 1
+        self.ct_in_flight = True
+        self.pending.append((self.clock.monotonic() + 0.05, Observation("echo")))
+        if self.ct_range is not None:
+            self.current_ct = min(max(mired, self.ct_range[0]), self.ct_range[1])
+
     def command(self, xy: XY) -> None:
         self.commands += 1
+        self.ct_in_flight = False
         now = self.clock.monotonic()
         self.pending.append((now + 0.05, Observation("echo")))
         self.current = project(xy, self.poly)
@@ -87,10 +102,12 @@ class FakeDevice:
 
     def read(self) -> None:
         self.reads += 1
+        when = self.clock.monotonic() + 0.05
+        if self.ct_in_flight:
+            self.pending.append((when, Observation("device", trusted=True, mired=self.current_ct)))
+            return
         # a read-back is the device's own value, even when it equals the command
-        self.pending.append(
-            (self.clock.monotonic() + 0.05, Observation("device", self.current, trusted=True))
-        )
+        self.pending.append((when, Observation("device", self.current, trusted=True)))
 
     def light_up(self) -> bool:
         self.lit_up += 1
@@ -123,14 +140,68 @@ def test_measure_recovers_the_polygon_by_reading_back() -> None:
     assert v.unanswered == 0
     # never answered before the read, so every sample read, and every answer was confirmed
     # by a second read that agreed; a device that applies at once is never switched on
-    assert dev.reads == 2 * dev.commands and dev.lit_up == 0
+    assert dev.reads == 2 * (dev.commands + dev.ct_commands) and dev.lit_up == 0
     assert not any("read-back" in n or "changing" in n for n in v.notes)
     assert dev.restored
+    # the colour-temperature range came with it: 153 and 500 mired are 6535 and 2000 K
+    assert dev.ct_commands == 2 and v.ct_range_k == (2000, 6535)
+    assert v.ct_answers == ((50, 153), (1000, 500))
     g = gamut_from(v, dev, clock)
     assert g is not None and g.bound_to == "fake-device-1" and g.measured is not None
     assert g.vertices == v.polygon
     assert g.clip_rule == "closest" and g.firmware == "1.116.3" and g.inherited_from is None
-    assert g.model_error == v.model_error
+    assert g.model_error == v.model_error and g.ct_range_k == (2000, 6535)
+
+
+def test_the_colour_temperature_range_has_its_own_switches_and_declines_honestly() -> None:
+    clock = _clock()
+    # a material without cct: no probe goes out and no range is recorded
+    dev = FakeDevice(clock, TRIANGLE)
+    v = measure(dev, clock=clock, ct=False)
+    assert v is not None and v.polygon is not None
+    assert dev.ct_commands == 0 and v.ct_range_k is None and v.ct_answers == ()
+    # the range alone, for a fixture whose polygon is already known: no colour probe
+    dev = FakeDevice(clock, TRIANGLE)
+    v = measure(dev, clock=clock, xy=False)
+    assert v is not None and v.polygon is None and v.aborted is None
+    assert dev.commands == 0 and dev.ct_commands == 2 and v.ct_range_k == (2000, 6535)
+    assert dev.restored and gamut_from(v, dev, clock) is None
+    # a device that ignores a colour temperature answers its resting value to both probes:
+    # not a range, declined with the evidence in the notes
+    dev = FakeDevice(clock, TRIANGLE, ct_range=None)
+    v = measure(dev, clock=clock)
+    assert v is not None and v.polygon is not None and v.ct_range_k is None
+    assert v.ct_answers == ((50, 370), (1000, 370))
+    assert any("range declined" in n and "50->370" in n for n in v.notes)
+    # a device that takes anything it is sent (or a transport echoing the command as the
+    # device's answer) claims 1000-20000 K: not a physical limit, declined
+    dev = FakeDevice(clock, TRIANGLE, ct_range=(1, 100000))
+    v = measure(dev, clock=clock)
+    assert v is not None and v.ct_range_k is None and v.ct_answers == ((50, 50), (1000, 1000))
+    # the range probes never run after an aborted polygon measurement
+    dev = FakeDevice(clock, TRIANGLE, lit_at=3)
+    v = measure(dev, clock=clock)
+    assert v is not None and v.aborted is not None and dev.ct_commands == 0
+
+
+def test_an_interruption_during_the_range_probes_keeps_the_polygon() -> None:
+    clock = _clock()
+
+    class LitDuringCt(FakeDevice):
+        def command_ct(self, mired: int) -> None:
+            super().command_ct(mired)
+            self.pending.append((self.clock.monotonic() + 0.3, Observation("lit")))
+
+    dev = LitDuringCt(clock, TRIANGLE)
+    v = measure(dev, clock=clock)
+    assert v is not None and v.polygon is not None and v.aborted is None
+    assert v.ct_range_k is None and dev.ct_commands == 1
+    assert any("range not measured: fixture turned on" in n for n in v.notes)
+    assert dev.restored and dev.restore_transition == 0.0  # put back at once
+    # the same interruption on a range-only run is the run's abort
+    dev = LitDuringCt(clock, TRIANGLE)
+    v = measure(dev, clock=clock, xy=False)
+    assert v is not None and v.aborted is not None and "turned on" in v.aborted
 
 
 def test_the_read_back_ends_the_sample_and_a_spontaneous_report_is_a_fallback() -> None:
@@ -142,8 +213,8 @@ def test_the_read_back_ends_the_sample_and_a_spontaneous_report_is_a_fallback() 
     # every sample read back and confirmed (the report came at the same instant and did not
     # replace it), and a fixture takes well under a minute: the exposed window per sample is
     # the read delay plus one round trip
-    assert dev.reads == 2 * dev.commands
-    assert clock.monotonic() - t0 < 24 * (READ_AFTER + 0.5)
+    assert dev.reads == 2 * (dev.commands + dev.ct_commands)
+    assert clock.monotonic() - t0 < (24 + 2) * (READ_AFTER + 0.5)
 
     class ReadsUnanswered(FakeDevice):
         def read(self) -> None:
@@ -152,7 +223,8 @@ def test_the_read_back_ends_the_sample_and_a_spontaneous_report_is_a_fallback() 
     dev2 = ReadsUnanswered(clock, TRIANGLE, reports=True)
     v2 = measure(dev2, clock=clock)
     assert v2 is not None and v2.polygon is not None and len(v2.polygon) == 3
-    assert dev2.reads == 3 * dev2.commands  # every read retried, the report carried the sample
+    # every read retried, the report carried the sample
+    assert dev2.reads == 3 * (dev2.commands + dev2.ct_commands)
 
 
 def test_probe_inside_the_true_gamut_is_answered_by_the_read_back() -> None:
@@ -181,7 +253,7 @@ def test_fixture_turning_on_aborts_and_withholds_the_polygon() -> None:
     dev2 = FakeDevice(clock, TRIANGLE, lit=True, lit_at=5)
     v2 = measure(dev2, allow_lit=True, clock=clock)
     assert v2 is not None and v2.polygon is not None and v2.aborted is None
-    assert v2.unanswered == 0 and dev2.reads == 2 * dev2.commands
+    assert v2.unanswered == 0 and dev2.reads == 2 * (dev2.commands + dev2.ct_commands)
 
     class AlwaysLit(FakeDevice):
         def command(self, xy: XY) -> None:
@@ -703,3 +775,95 @@ def test_light_up_switches_on_and_restore_puts_the_colour_back_before_switching_
         "z2m-4/strip/set",
         '{"color": {"x": 0.434, "y": 0.383}, "transition": 0.2}',
     )
+
+
+def test_colour_temperature_is_commanded_read_and_classified_like_colour() -> None:
+    """A Hue bulb sent 50 mired clips to 153 and answers it on the read; the echo repeats the
+    command; a read landing before the device applied the command shows the value from
+    before it and is unapplied. The read payload is the same one colour uses."""
+    link = FakeLink()
+    ch = Z2MDeviceChannel(link, "z2m-3/bulb/set")
+    link.deliver("z2m-3/bulb", {"state": "OFF", "color_mode": "color_temp", "color_temp": 370})
+    assert ch.is_lit() is False
+    ch.command_ct(50)
+    assert link.published[-1] == ("z2m-3/bulb/set", '{"color_temp": 50, "transition": 0}')
+    link.deliver("z2m-3/bulb/set", '{"color_temp": 50, "transition": 0}')  # our own
+    link.deliver("z2m-3/bulb", {"color_temp": 50, "color_mode": "color_temp", "state": "OFF"})
+    link.deliver("z2m-3/bulb", {"color_temp": 370, "color_mode": "color_temp", "state": "OFF"})
+    assert [o.kind for o in ch.observe(0.1)] == ["echo"]  # the resting value repeated: not new
+    ch.read()
+    assert link.published[-1] == ("z2m-3/bulb/get", '{"color": {"x": "", "y": ""}}')
+    link.deliver("z2m-3/bulb", {"color_temp": 370, "color_mode": "color_temp", "state": "OFF"})
+    obs = ch.observe(0.1)
+    assert [(o.kind, o.mired, o.xy) for o in obs] == [("unapplied", 370, None)]
+    link.deliver("z2m-3/bulb", {"color_temp": 153, "color_mode": "color_temp", "state": "OFF"})
+    obs = ch.observe(0.1)
+    assert [(o.kind, o.mired, o.trusted) for o in obs] == [("device", 153, True)]
+    # a colour in the same message is not this sample's evidence, and a colour command
+    # afterwards is classified as colour again
+    ch.command((0.95, 0.04))
+    ch.read()
+    link.deliver("z2m-3/bulb", {"color": {"x": 0.6915, "y": 0.3083}, "color_temp": 153})
+    obs = ch.observe(0.1)
+    assert [(o.kind, o.xy, o.mired) for o in obs] == [("device", (0.6915, 0.3083), None)]
+
+
+def test_multi_endpoint_colour_temperature_answer_lands_unsuffixed_too() -> None:
+    link = FakeLink()
+    ch = Z2MDeviceChannel(link, "z2m-1/sconce/top/set")
+    ch.command_ct(1000)
+    link.deliver("z2m-1/sconce", {"color_temp": 250, "color_temp_top": 1000})  # echo + stale
+    assert [o.kind for o in ch.observe(0.1)] == ["echo"]
+    ch.read()
+    link.deliver("z2m-1/sconce", {"color_temp": 500, "color_temp_top": 1000})
+    obs = ch.observe(0.1)
+    assert [(o.kind, o.mired, o.trusted) for o in obs] == [("device", 500, True)]
+    # the other endpoint's value, republished unsuffixed before the read, is never taken as
+    # this one's answer when it comes again after it
+    ch.command_ct(50)
+    link.deliver("z2m-1/sconce", {"color_temp": 366, "color_temp_top": 50})
+    assert [o.kind for o in ch.observe(0.1)] == ["echo"]
+    ch.read()
+    link.deliver("z2m-1/sconce", {"color_temp": 366, "color_temp_top": 50})
+    assert [o.kind for o in ch.observe(0.1)] == ["echo"]
+    link.deliver("z2m-1/sconce", {"color_temp": 153, "color_temp_top": 50})
+    assert [(o.kind, o.mired) for o in ch.observe(0.1)] == [("device", 153)]
+
+
+def test_the_range_is_measured_over_the_channel_with_the_real_message_shapes() -> None:
+    """End to end over the Zigbee2MQTT channel: a simulated Hue bulb clamps to 153..500."""
+    from pascl.shell.gamut_measure import take_ct_sample
+
+    class Bulb(FakeLink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ct = 370
+
+        def publish(self, topic: str, payload: str) -> None:
+            super().publish(topic, payload)
+            body = json.loads(payload)
+            if topic.endswith("/set") and "color_temp" in body:
+                self.deliver("z2m-3/bulb", {"color_temp": body["color_temp"], "state": "OFF"})
+                self.ct = min(max(body["color_temp"], 153), 500)
+            elif topic.endswith("/get"):
+                self.deliver("z2m-3/bulb", {"color_temp": self.ct, "state": "OFF"})
+
+    clock = _clock()
+    link = Bulb()
+    ch = Z2MDeviceChannel(link, "z2m-3/bulb/set")
+
+    class Ticking:
+        def observe(self, seconds: float) -> list[Observation]:
+            clock.advance(seconds)
+            return ch.observe(seconds)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(ch, name)
+
+    dev = Ticking()
+    link.deliver("z2m-3/bulb", {"state": "OFF", "color_temp": 370})
+    assert ch.snapshot() is not None
+    s1 = take_ct_sample(dev, 50, clock)  # type: ignore[arg-type]
+    assert s1.mired == 153 and s1.trusted and s1.confirmed
+    s2 = take_ct_sample(dev, 1000, clock)  # type: ignore[arg-type]
+    assert s2.mired == 500 and s2.trusted and s2.confirmed

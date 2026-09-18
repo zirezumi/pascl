@@ -171,7 +171,15 @@ def render_fixture(
     can_ct = "cct" in material.capabilities and goal_xy is not None
     matches_natural = can_ct and natural_bulb is not None and _near(goal_xy, natural_bulb, tol)
     matches_warm = can_ct and warm_bulb is not None and _near(goal_xy, warm_bulb, tol)
-    min_k = material.cct_range_k[0] if material.cct_range_k else DEFAULT_MIN_KELVIN
+    # The floor is the MEASURED one when the fixture has it (``Gamut.ct_range_k``): a material's
+    # declaration is what the transport advertised, and a bulb advertising 1000 K over a
+    # physical 2000 K would be sent colour temperatures it clips, then judged against them.
+    ct_range = (
+        fx.gamut.ct_range_k
+        if fx.gamut is not None and fx.gamut.ct_range_k is not None
+        else material.cct_range_k
+    )
+    min_k = ct_range[0] if ct_range else DEFAULT_MIN_KELVIN
     ceiling_mired = kelvin_to_mired(min_k)
     goal_ct: int | None = None
     use_ct = False

@@ -66,3 +66,9 @@ def blend_xy(goal: XY, target: XY, t: float) -> XY:
 
 def kelvin_to_mired(kelvin: float) -> int:
     return int(1e6 / kelvin)
+
+
+def mired_to_kelvin(mired: float) -> int:
+    """Truncated like the host's own conversion (153 mired is 6535 K there, not 6536), so a
+    range measured in mireds compares exactly with the kelvin a host reports."""
+    return int(1e6 / mired)

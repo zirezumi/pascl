@@ -13,6 +13,7 @@ from pascl.model import (
     Gamut,
     ModelError,
     dumps,
+    fixture_cct_range,
     fixture_clip,
     fixture_gamut,
     fixture_model_label,
@@ -76,6 +77,7 @@ def test_full_record_round_trips(raw: dict[str, Any]) -> None:
         "model_error": 0.0014,
         "clip_rule": "toward_white",
         "firmware": "1.116.3",
+        "ct_range_k": [2000, 6535],
     }
     _fixture(raw, "den", "den_pendant_2")["gamut"] = {
         "vertices": TRIANGLE,
@@ -93,6 +95,27 @@ def test_full_record_round_trips(raw: dict[str, Any]) -> None:
         tuple(tuple(v) for v in TRIANGLE),
         "toward_white",
     )
+    assert to_dict(model)["home_model"]["rooms"]["den"]["fixtures"]["den_pendant_1"]["gamut"][
+        "ct_range_k"
+    ] == [2000, 6535]
+
+
+def test_the_measured_ct_range_wins_over_the_declared_one(raw: dict[str, Any]) -> None:
+    # the demo's colour bulbs declare 2000-6535 K; pendant 1 is measured narrower, pendant 2
+    # is not measured and keeps the declaration; the strip has no cct at all
+    _fixture(raw, "den", "den_pendant_1")["gamut"] = {
+        "vertices": TRIANGLE,
+        "ct_range_k": [2200, 6000],
+    }
+    model = from_dict(raw)
+    assert validate(model) == []
+    assert fixture_cct_range(model, "den_pendant_1") == (2200, 6000)
+    assert fixture_cct_range(model, "den_pendant_2") == (2000, 6535)
+    assert fixture_cct_range(model, "den_strip") is None
+    assert fixture_cct_range(model, "no_such_fixture") is None
+    # a declared range must be ordered
+    raw["home_model"]["materials"]["color_bulb"]["cct_range_k"] = [6535, 2000]
+    assert any("min below max" in p for p in validate(from_dict(raw)))
 
 
 def test_gamut_is_strict(raw: dict[str, Any]) -> None:
@@ -117,6 +140,11 @@ QUAD = [[0.1532, 0.0475], [0.40, 0.12], [0.6915, 0.3083], [0.17, 0.70]]
         ({"vertices": TRIANGLE, "inherited_from": "den_strip"}, "inherited from itself"),
         ({"vertices": TRIANGLE, "inherited_from": "no_such"}, "not a measured fixture"),
         ({"vertices": TRIANGLE, "inherited_from": "den_pendant_1"}, "not a measured fixture"),
+        ({"vertices": TRIANGLE, "ct_range_k": [2000]}, "expected [min_k, max_k]"),
+        ({"vertices": TRIANGLE, "ct_range_k": [2000.5, 6535]}, "expected [min_k, max_k]"),
+        ({"vertices": TRIANGLE, "ct_range_k": [6535, 2000]}, "inside 1000-20000 K"),
+        ({"vertices": TRIANGLE, "ct_range_k": [900, 6535]}, "inside 1000-20000 K"),
+        ({"vertices": TRIANGLE, "ct_range_k": [2000, 20001]}, "inside 1000-20000 K"),
     ],
 )
 def test_bad_gamuts_are_model_errors(
@@ -168,6 +196,13 @@ def test_gamut_needs_an_xy_material(raw: dict[str, Any]) -> None:
     with pytest.raises(ModelError) as e:
         load(yaml.safe_dump(raw))
     assert any("xy capability" in msg for msg in e.value.errors)
+
+
+def test_a_ct_range_needs_a_cct_material(raw: dict[str, Any]) -> None:
+    _fixture(raw, "den", "den_strip")["gamut"] = {"vertices": TRIANGLE, "ct_range_k": [2000, 6535]}
+    with pytest.raises(ModelError) as e:
+        load(yaml.safe_dump(raw))
+    assert any("without the cct capability" in msg for msg in e.value.errors)
 
 
 def test_with_fixture_gamut_is_a_functional_update() -> None:

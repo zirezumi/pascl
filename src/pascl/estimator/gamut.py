@@ -40,6 +40,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from pascl.core.color import mired_to_kelvin
 from pascl.core.gamut import (
     CLIP_RULES,
     XY,
@@ -51,7 +52,7 @@ from pascl.core.gamut import (
     polygon_problems,
     project,
 )
-from pascl.model import Gamut, HomeModel, with_fixture_gamut
+from pascl.model import KELVIN_MAX, KELVIN_MIN, Gamut, HomeModel, with_fixture_gamut
 from pascl.model.geometry import MAX_VERTICES, SAME_MODEL_FAIL, vertex_deviation
 
 #: Far-outside valid chromaticities (x, y >= 0.02, x + y <= 0.99), ordered so consecutive
@@ -111,6 +112,12 @@ INTERIOR_TOL: Final = 0.002
 #: times the rule's median gap is one the rule cannot account for and is set aside.
 OUTLIER_FLOOR: Final = 0.005
 OUTLIER_FACTOR: Final = 10.0
+#: The colour temperatures commanded to find a device's range, in mireds, coolest first:
+#: past any real device's coolest (50 mired, 20000 K) and warmest (1000 mired, 1000 K), so
+#: the device clips to its physical limits and answers them. Coolest first because a fixture
+#: at rest is far more often at its warm end (the night floor) than at its cool one, and a
+#: probe answered with the resting value is indistinguishable from one not applied.
+CT_PROBES_MIRED: Final[tuple[int, int]] = (50, 1000)
 
 Kind = Literal["far", "vertex", "edge"]
 
@@ -153,6 +160,32 @@ class Verdict:
     """The evidence: each answered probe with the device's own value."""
     aborted: str | None = None
     """Why the measurement was cut short, when it was; the polygon is then withheld."""
+    ct_range_k: tuple[int, int] | None = None
+    """The colour temperatures the device can show, kelvin (floor, ceiling), from the two
+    probes in ``CT_PROBES_MIRED``; None when not measured or declined (``ct_range_from``)."""
+    ct_answers: tuple[tuple[int, int | None], ...] = ()
+    """The evidence: each colour-temperature probe (mireds) with the device's answer."""
+
+
+def ct_range_from(answers: Mapping[int, int | None]) -> tuple[int, int] | None:
+    """The device's colour-temperature range, kelvin (floor, ceiling), from its answers
+    (mireds) to the probes in ``CT_PROBES_MIRED``. Declined, None, when a probe went
+    unanswered, when the device answered a probe with the probe's own value (the echo, or a
+    device that claims 1000-20000 K, neither a physical limit), or when the pair is not an
+    ordered range inside ``KELVIN_MIN``-``KELVIN_MAX``. Kelvin are truncated the way a host
+    converts them, so the range compares exactly with what the host reports."""
+    cool_probe, warm_probe = CT_PROBES_MIRED
+    coolest, warmest = answers.get(cool_probe), answers.get(warm_probe)
+    if coolest is None or warmest is None:
+        return None
+    if coolest == cool_probe or warmest == warm_probe:
+        return None
+    if coolest <= 0 or warmest <= 0:
+        return None
+    floor_k, ceiling_k = mired_to_kelvin(warmest), mired_to_kelvin(coolest)
+    if not KELVIN_MIN <= floor_k < ceiling_k <= KELVIN_MAX:
+        return None
+    return (floor_k, ceiling_k)
 
 
 def is_echo(command: XY, reported: XY, tol: float = ECHO_TOL) -> bool:
@@ -642,6 +675,7 @@ def inherit(
                 clip_rule=src.clip_rule,
                 inherited_from=seed.source,
                 firmware=None,
+                ct_range_k=src.ct_range_k,
             ),
         )
     return out, applied

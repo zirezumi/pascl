@@ -149,6 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
         "fixture at once, when the room fills or the fixture is turned on)",
     )
     me.add_argument(
+        "--ct-only",
+        dest="ct_only",
+        action="store_true",
+        help="measure the colour-temperature range alone (two probes, a few seconds) and "
+        "record it on the fixture's existing gamut; the polygon must already be measured",
+    )
+    me.add_argument(
         "--write", type=Path, help="write the model with the measurement recorded to this path"
     )
     au = gs.add_parser(
@@ -427,12 +434,14 @@ def _cmd_gamut_measure(args: argparse.Namespace, model: Any) -> int:
     command topic, or the light entity the host exposes), measured together in batches sized
     per coordinator or transport, the verdicts printed with every rule's fit, and the model
     written with the records (refusing any the model would not validate with)."""
+    from dataclasses import replace
+
     from pascl.estimator.gamut import confirm_seed
     from pascl.harness.binding import expand, load_binding
     from pascl.model import dumps, validate, with_fixture_gamut
     from pascl.shell.airtime import measure_adaptively
     from pascl.shell.gamut_measure import gamut_from
-    from pascl.shell.gamut_runtime import channel_for, device_infos
+    from pascl.shell.gamut_runtime import channel_for, device_infos, takes_ct
     from pascl.shell.hub import Hub
 
     binding = load_binding(args.binding.read_text(encoding="utf-8"))
@@ -478,6 +487,8 @@ def _cmd_gamut_measure(args: argparse.Namespace, model: Any) -> int:
                 on_launch=lambda n, f, w: print(
                     f"launch {n} ({f} of {w} on its transport)", file=sys.stderr
                 ),
+                ct={f for f in channels if takes_ct(model, f)},
+                xy=not args.ct_only,
             )
         finally:
             hub.stop()
@@ -506,10 +517,29 @@ def _cmd_gamut_measure(args: argparse.Namespace, model: Any) -> int:
                 f"{r.rule}={r.error:.5f}" + (f"(-{r.outliers})" if r.outliers else "")
                 for r in verdict.fits
             )
+            ct = verdict.ct_range_k
+            ct_text = "declined" if ct is None else f"{ct[0]}-{ct[1]} K"
+            if args.ct_only:
+                print(f"{f}: ct_range_k {ct_text} answers {list(verdict.ct_answers)}")
+                held = _held_gamut(updated, f)
+                if ct is None or held is None:
+                    if held is None:
+                        print(f"{f}: no polygon on record; measure it first", file=sys.stderr)
+                    failed += 1
+                    continue
+                candidate = with_fixture_gamut(updated, f, replace(held, ct_range_k=ct))
+                problems = validate(candidate)
+                if problems:
+                    for p in problems:
+                        print(f"{f}: refused: {p}", file=sys.stderr)
+                    failed += 1
+                    continue
+                updated = candidate
+                continue
             print(
                 f"{f}: polygon {verdict.polygon} clip_rule {verdict.clip_rule} model_error "
                 f"{verdict.model_error} fits [{fits}] device_reports {verdict.device_reports} "
-                f"unanswered {verdict.unanswered}"
+                f"unanswered {verdict.unanswered} ct_range_k {ct_text}"
             )
             gamut = gamut_from(verdict, channels[f])
             if gamut is None:
@@ -616,7 +646,7 @@ def _held_gamut(model: Any, fixture_id: str) -> Any:
 
 def _cmd_palette(args: argparse.Namespace) -> int:
     """Palette colours against the measured gamuts: what renders, and what does not."""
-    from pascl.core.palette_reach import unreachable
+    from pascl.core.palette_reach import cct_credibility, cct_unreachable, unreachable
     from pascl.model import load
 
     if args.palette_command != "check":
@@ -633,13 +663,30 @@ def _cmd_palette(args: argparse.Namespace) -> int:
             f"{u.reachable[0]:.4f} {u.reachable[1]:.4f}  gap {u.gap:.4f}  "
             f"{len(u.fixtures)} fixture(s): {', '.join(u.fixtures)}"
         )
+    ct_rows = cct_unreachable(model)
+    for c in ct_rows:
+        print(
+            f"{c.palette:16s} {'ct arc':14s} {c.kelvin:.0f} K -> {c.reachable} K  "
+            f"gap {c.gap:.0f} K  (range {c.ct_range_k[0]}-{c.ct_range_k[1]} K)  "
+            f"{len(c.fixtures)} fixture(s): {', '.join(c.fixtures)}"
+        )
+    for cred in cct_credibility(model):
+        print(
+            f"ct range {cred.ct_range_k[0]}-{cred.ct_range_k[1]} K ({cred.source}) on "
+            f"{len(cred.fixtures)} fixture(s): {cred.note}: {', '.join(cred.fixtures)}",
+            file=sys.stderr,
+        )
     measured = sum(
         1 for room in model.rooms.values() for fx in room.fixtures.values() if fx.gamut is not None
     )
     print(
-        f"{len(rows)} unreachable palette colour(s) across {measured} fixture(s) with a gamut",
+        f"{len(rows)} unreachable palette colour(s) across {measured} fixture(s) with a gamut; "
+        f"{len(ct_rows)} colour temperature arc(s) parked at a white-only fixture's range",
         file=sys.stderr,
     )
+    # A device clipping a colour the author chose is a surprise worth a non-zero exit; a
+    # white-only fixture parked at its floor for the night arc is the render's own, deliberate
+    # floor, and a range that is not credible is a call to measure, not a failure.
     return 1 if rows else 0
 
 

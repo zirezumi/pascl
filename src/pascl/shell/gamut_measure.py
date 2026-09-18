@@ -23,6 +23,12 @@ command (it does not apply colour while off; in the forced mode the driver switc
 starts over, otherwise it says so and stops), answer nothing at all (not reachable this way),
 or still be changing colour when the sample runs out (a ramp too slow to measure).
 
+After the polygon, the colour-temperature range: two probes past any real device's ends
+(``CT_PROBES_MIRED``), commanded and read back under the same timing rules (``take_ct_sample``,
+``measure_ct``), the pair of answers forming the range or, when a probe went unanswered or the
+answers are not a physical range, nothing (``ct_range_from``). A material without a colour
+temperature is not probed (``ct=False``), and ``xy=False`` measures the range alone.
+
 A measured fixture holds a probe colour for as long as a sample lasts, and a fixture that is
 turned on then shows that colour. Three things end a measurement early, all of them meant to
 put the fixture back to its intended colour BEFORE a turn-on can show anything, and all of them
@@ -43,7 +49,7 @@ from typing import Final, Literal, Protocol
 
 from pascl.clock import Clock, SystemClock
 from pascl.core.gamut import XY
-from pascl.estimator.gamut import Probe, Verdict, is_echo
+from pascl.estimator.gamut import CT_PROBES_MIRED, Probe, Verdict, ct_range_from, is_echo
 from pascl.model import Gamut
 
 #: Seconds after the command before the first read-back: the device applies a zero transition
@@ -89,6 +95,9 @@ class Observation:
     """The channel read this value back from the device, so it is the device's own even when
     it equals the command (the device reached it); an untrusted value equal to the command is
     taken for the echo."""
+    mired: int | None = None
+    """The device's colour temperature, for an observation made under a colour-temperature
+    command (``command_ct``); ``xy`` is then None."""
 
 
 class DeviceChannel(Protocol):
@@ -113,8 +122,12 @@ class DeviceChannel(Protocol):
     def command(self, xy: XY) -> None:
         """Command the colour with a zero transition."""
 
+    def command_ct(self, mired: int) -> None:
+        """Command a colour temperature with a zero transition; the observations that follow
+        carry ``mired`` (see :func:`take_ct_sample`)."""
+
     def read(self) -> None:
-        """Ask the device to report its current colour."""
+        """Ask the device to report its current colour (a colour temperature comes with it)."""
 
     def observe(self, seconds: float) -> list[Observation]:
         """Block up to ``seconds`` and return what arrived, classified."""
@@ -154,6 +167,8 @@ class Sample:
     """Every answered read-back showed the colour from before the command and nothing else
     came: the device did not apply the command (it keeps its colour while off, or ignores
     the command)."""
+    mired: int | None = None
+    """The answer to a colour-temperature sample (:func:`take_ct_sample`); ``xy`` is None."""
 
 
 def take_sample(
@@ -254,6 +269,133 @@ def take_sample(
     )
 
 
+def take_ct_sample(
+    channel: DeviceChannel, mired: int, clock: Clock, *, interrupt: bool = True
+) -> Sample:
+    """Command one colour temperature and collect the device's answer, in mireds, under the
+    same timing rules as :func:`take_sample`: read back after ``READ_AFTER``, confirmed by a
+    second read-back that agrees, read again after ``READ_RETRY`` while two disagree, and a
+    read-back that still shows the value from before the command is ``unapplied``. Only a
+    read-back counts: a spontaneous colour-temperature report is a transport's clamp of the
+    command as often as the device's word, and the range must be the device's."""
+    channel.command_ct(mired)
+    start = clock.monotonic()
+    end = start + ANSWER_TIMEOUT
+    candidate: int | None = None
+    settled: int | None = None
+    foreign = lit = occupied = moved = False
+    reads = answered = unapplied = retries = 0
+    first_read: float | None = None
+    answered_at: float | None = None
+    next_read = start + READ_AFTER
+    while clock.monotonic() < end and settled is None:
+        now = clock.monotonic()
+        if now >= next_read and reads < MAX_SETTLE_READS and reads - answered < MAX_READS:
+            channel.read()
+            reads += 1
+            if first_read is None:
+                first_read = now
+            next_read = now + READ_RETRY
+        for ob in channel.observe(max(MIN_WAIT, min(POLL, end - now))):
+            if ob.kind == "foreign":
+                foreign = True
+            elif ob.kind == "lit":
+                lit = True
+            elif ob.kind == "occupied":
+                occupied = True
+            elif ob.mired is None:
+                continue  # a colour observation, or an echo: not this sample's evidence
+            elif ob.kind == "unapplied":
+                answered += 1
+                unapplied += 1
+            elif ob.kind == "device" and ob.trusted:
+                answered += 1
+                if candidate is None:
+                    answered_at = clock.monotonic()
+                    retries = max(0, reads - 1)
+                    candidate = ob.mired
+                    next_read = clock.monotonic()  # confirm at once
+                elif candidate == ob.mired:
+                    settled = ob.mired
+                else:
+                    moved = True
+                    candidate = ob.mired
+                    next_read = clock.monotonic() + READ_RETRY
+        if interrupt and (lit or occupied):
+            break
+    latency = None
+    if first_read is not None and answered_at is not None:
+        latency = max(0.0, answered_at - first_read)
+    if candidate is None:
+        retries = max(0, reads - 1)
+    if settled is not None:
+        return Sample(
+            None, False, foreign, lit, True, occupied, reads, latency, retries, True, moved,
+            mired=settled,
+        )  # fmt: skip
+    if candidate is not None and not moved:
+        # one trusted answer, and the confirming read-back went unanswered
+        return Sample(
+            None, False, foreign, lit, True, occupied, reads, latency, retries, mired=candidate
+        )
+    if candidate is not None:
+        # still changing when the sample ran out: no answer
+        return Sample(
+            None, False, foreign, lit, False, occupied, reads, latency, retries, False, True
+        )
+    return Sample(
+        None, False, foreign, lit, False, occupied, reads, None, retries, unapplied=unapplied > 0
+    )
+
+
+def measure_ct(
+    channel: DeviceChannel,
+    clock: Clock,
+    *,
+    allow_lit: bool = False,
+    abort_when: Callable[[], str | None] | None = None,
+    on_sample: Callable[[Sample], None] | None = None,
+) -> tuple[tuple[int, int] | None, tuple[tuple[int, int | None], ...], tuple[str, ...], str | None]:
+    """The colour-temperature range of the fixture on ``channel``: the two probes in
+    ``CT_PROBES_MIRED`` commanded and read back, with a foreign command retaking the sample
+    once. Returns the range (``ct_range_from``, None when declined), the answers, notes for
+    the verdict, and the interruption that cut it short, if one did (the caller restores at
+    once; the fixture is not put back here). Runs after the polygon protocol, or on its own
+    for a fixture whose polygon is already known."""
+    answers: dict[int, int | None] = {}
+    notes: list[str] = []
+    for mired in CT_PROBES_MIRED:
+        if abort_when is not None and (reason := abort_when()) is not None:
+            return None, tuple(answers.items()), tuple(notes), reason
+        sample = take_ct_sample(channel, mired, clock, interrupt=not allow_lit)
+        if on_sample is not None:
+            on_sample(sample)
+        interrupted = (sample.lit or sample.occupied) and not allow_lit
+        if sample.foreign and not interrupted:
+            _wait(channel, clock, RETAKE_PAUSE)
+            sample = take_ct_sample(channel, mired, clock, interrupt=not allow_lit)
+            if on_sample is not None:
+                on_sample(sample)
+            interrupted = (sample.lit or sample.occupied) and not allow_lit
+        if interrupted:
+            reason = (
+                "room became occupied during the measurement"
+                if sample.occupied and not sample.lit
+                else "fixture turned on during the measurement"
+            )
+            return None, tuple(answers.items()), tuple(notes), reason
+        answers[mired] = sample.mired
+        if sample.mired is None:
+            what = "not applied" if sample.unapplied else "unanswered"
+            notes.append(f"colour temperature probe {mired} mired {what}")
+        _wait(channel, clock, PAUSE)
+    rng = ct_range_from(answers)
+    if rng is None and all(v is not None for v in answers.values()):
+        got = ", ".join(f"{m}->{v}" for m, v in answers.items())
+        notes.append(f"colour temperature range declined: the probes answered {got}")
+    return rng, tuple(answers.items()), tuple(notes), None
+
+
 def measure(
     channel: DeviceChannel,
     *,
@@ -262,10 +404,19 @@ def measure(
     probe: Probe | None = None,
     abort_when: Callable[[], str | None] | None = None,
     on_sample: Callable[[Sample], None] | None = None,
+    ct: bool = True,
+    xy: bool = True,
 ) -> Verdict | None:
     """Measure the fixture on ``channel``. None when it is lit and ``allow_lit`` is false: a
     lit fixture shows every probe colour on the wall. With ``allow_lit`` (the forced mode)
     the fixture is measured whatever its state and whoever is in the room, visibly.
+
+    Two things are measured, each on its own switch: the polygon (``xy``, the probe protocol)
+    and, after it, the colour-temperature range (``ct``, the two probes of ``measure_ct``,
+    for a material that takes a colour temperature). A run with ``xy`` off measures the
+    range alone, for a fixture whose polygon is already known; its verdict carries no
+    polygon. An interruption during the range probes keeps a polygon already measured and
+    declines the range with a note, since the polygon's evidence is complete.
 
     Without it the measurement is meant to be invisible, and it aborts, restoring the
     fixture at once with no transition and withholding the polygon, on the first sign that
@@ -294,8 +445,12 @@ def measure(
     opening = {"unapplied": 0, "silent": 0, "unsettled": 0}
     lit_up = False
     unconfirmed = ramped = unsettled = 0
+    ct_range: tuple[int, int] | None = None
+    ct_answers: tuple[tuple[int, int | None], ...] = ()
+    ct_notes: tuple[str, ...] = ()
+    cut: str | None = None
     try:
-        while (step := pr.next()) is not None:
+        while xy and (step := pr.next()) is not None:
             if abort_when is not None and (aborted := abort_when()) is not None:
                 break
             sample = take_sample(channel, step.xy, clk, previous, interrupt=not allow_lit)
@@ -339,10 +494,18 @@ def measure(
             if sample.xy is not None:
                 previous = sample.xy
             _wait(channel, clk, PAUSE)
+        if ct and aborted is None:
+            ct_range, ct_answers, ct_notes, cut = measure_ct(
+                channel, clk, allow_lit=allow_lit, abort_when=abort_when, on_sample=on_sample
+            )
+            if cut is not None:
+                ct_notes = (*ct_notes, f"colour temperature range not measured: {cut}")
+                if not xy:
+                    aborted = cut
     finally:
-        channel.restore(0.0 if aborted is not None else 0.2)
+        channel.restore(0.0 if aborted is not None or cut is not None else 0.2)
     verdict = pr.verdict()
-    notes = list(verdict.notes)
+    notes = [*verdict.notes, *ct_notes]
     if lit_up:
         notes.append("switched on for the measurement: the device keeps its colour while off")
     if unconfirmed:
@@ -361,7 +524,7 @@ def measure(
             f"when the sample ran out"
         )
     if aborted is None:
-        return replace(verdict, notes=tuple(notes))
+        return replace(verdict, notes=tuple(notes), ct_range_k=ct_range, ct_answers=ct_answers)
     return replace(
         verdict,
         polygon=None,
@@ -369,6 +532,7 @@ def measure(
         fits=(),
         notes=(*notes, f"aborted: {aborted}"),
         aborted=aborted,
+        ct_answers=ct_answers,
     )
 
 
@@ -436,4 +600,5 @@ def gamut_from(
         clip_rule=verdict.clip_rule,
         inherited_from=None,
         firmware=channel.firmware,
+        ct_range_k=verdict.ct_range_k,
     )

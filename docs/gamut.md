@@ -104,15 +104,18 @@ den_strip:
     clip_rule: closest
     inherited_from: null                  # or the measured fixture this was copied from
     firmware: "1.163.1"                   # information, never a staleness trigger
+    ct_range_k: [2000, 6535]              # measured with it; see section 11
 ```
 
 Validation rejects a polygon that is not convex, not counter-clockwise, too small, or on a
 material without the `xy` capability; a `rgb_clamp` rule on anything but a triangle; an
-`inherited_from` that does not name a measured fixture of the same material model label; and
-two measured units of one label further apart than 0.02 (one measurement is wrong, or the
-label is). `fixture_clip(model, id)` resolves a fixture to its polygon and rule, or to the
-identity; `with_fixture_gamut` records a measurement as a functional update, the way the
-tuning UI writes the model.
+`inherited_from` that does not name a measured fixture of the same material model label; two
+measured units of one label further apart than 0.02 (one measurement is wrong, or the label
+is); and a `ct_range_k` that is not an ordered pair inside 1000-20000 K or sits on a material
+without `cct`. `fixture_clip(model, id)` resolves a fixture to its polygon and rule, or to the
+identity; `fixture_cct_range` to its measured range, else its material's declaration;
+`with_fixture_gamut` records a measurement as a functional update, the way the tuning UI
+writes the model.
 
 ## 4. Seeds: a measurement travels with its provenance
 
@@ -262,7 +265,14 @@ lists every palette colour some measured fixture cannot show, with the colour th
 instead: static entries per family (bulbs, strips) and, for the solar white palettes, the
 worst excursion along each calibration's warm-to-cool and warm-to-night arc. Fixtures that
 share a polygon and rule are reported together. Nothing at runtime depends on it (the
-comparators are exact about reachability); it makes the author's choice visible.
+comparators are exact about reachability); it makes the author's choice visible, and the
+exit status is non-zero when there is one.
+
+The same report covers colour temperature (section 11): the part of the solar arc a
+white-only fixture (`cct` without `xy`) parks at its range's end, since it has no xy to fall
+back to; and every range in force that is not credible for a physical emitter (outside
+1500-10000 K), which is a transport's placeholder to be measured, not a colour to move. Both
+are information: the parked arc is the render's own floor, and neither fails the check.
 
 ## 9. When to judge: the report cadence (pascl.estimator.reporting)
 
@@ -303,3 +313,68 @@ and a value can only ever move the arm later. On the reference installation the 
 derivation measured 10.04 s on every Hue strip, spot and BR30 and 10.37 s on the A19/A21 bulbs,
 a jitter of 3.9 s at the 99th percentile, and zero to two false arms in 223 trips where the fixed
 delay had lost all of them.
+
+## 10. After the fade, the runtime reads (`pascl.core.settle`)
+
+Section 9 answers WHEN a device that reports will have reported. The reference installation
+then established that reporting is not something a transport promises: Zigbee2MQTT configures
+level and on/off reporting on a bulb and nothing for colour; the fixtures there that report a
+colour at all do so through a leftover binding of Hue's private cluster that the coordinator
+stopped creating in 2026-05, and 27 of the 85 never report one, so for those the host holds the
+transport's echo of the last command and a comparator fed by reports is blind. A cadence
+derived from observation is a model of a behaviour the transport does not owe anyone.
+
+So the runtime asks. After a render command's fade has ended it reads the colour back, once,
+with the same `/get` the measurement uses (`READ_COLOUR_PAYLOAD` in `pascl.shell.z2m`: one
+ZCL frame answering colour mode, xy and colour temperature together, the device's whole state
+republished on its base topic), and the comparator arms after the answer has had time to land.
+The rule, and the numbers the reference installation's generated templates carry verbatim:
+
+- the fade ends at the command plus its transition (`fade_end`);
+- the read goes out `READ_MARGIN_S` (1.5 s) after that, covering the device's coarse
+  transition ticks and a host whose command time runs ahead of the frame (`read_at`);
+- the comparator arms `READ_ALLOWANCE_S` (4.0 s) after the read: the queue when every colour
+  fixture on one radio was commanded in the same render, plus a transport retry (`arm_at`);
+- a read is issued only when it can say something (`worth_reading`): the fixture is lit and its
+  colour intent moved past the comparator's tolerance on some axis since the previous command.
+  A fade that moved the intent by less cannot produce a divergence the comparator would act on.
+  On the reference installation that gate keeps about one colour command in twenty-five, some
+  2,300-3,000 reads a day fleet-wide, each a unicast request and answer of 50-80 ms;
+- one due time per fixture (`ReadSchedule`): a fixture commanded again before its read is due
+  is read once, after the later fade.
+
+The failure direction is unchanged from before reads existed: an unanswered read leaves the
+comparator with what the host already held, and only the allowance is waited for beyond the
+fade. An answered read replaces the echo with the device's own state, which is what makes the
+comparator honest on fixtures that never report, and it carries the level too, so the brightness
+comparator (`levels.md`) gets an exact device-unit reading from the same frame.
+
+Section 9's estimator stays as a diagnostic of a transport's reporting, and as the arm's input on
+an installation that chooses to trust reports; on the reference installation the arm is this
+section's, and the report interval and jitter describe the reports it no longer waits for.
+
+## 11. The colour-temperature range is measured too (`Gamut.ct_range_k`)
+
+A fixture that takes a colour temperature clips one outside its range exactly as it clips a
+chromaticity outside its polygon, and the range the transport declares is what the device
+advertises, not what it does. On the reference installation 22 bulbs of one model advertise
+1000-20000 K over a physical 2000-6535 K; the render, flooring the night white at the
+declaration, sent them 1475 K, the devices showed 2000 K, and a comparator judging them against
+the intent would have repainted them every 30 s all night. So the range is measured with the
+polygon: two probes past any real device's ends (`CT_PROBES_MIRED`, 50 and 1000 mired, coolest
+first because a fixture at rest is far more often at its warm end), each read back and confirmed
+under the polygon's timing rules (`take_ct_sample`, `measure_ct`), and the two answers form the
+range (`ct_range_from`), in kelvin truncated the way a host converts them so the range compares
+exactly with what the host reports. The measurement declines rather than guesses: a probe
+unanswered, a probe answered with its own value (the transport's echo, or a device claiming
+1000-20000 K), or a pair that is not an ordered range inside 1000-20000 K yields `None`, with
+the evidence in the verdict's notes.
+
+The range travels like the polygon (a seed copies it) and is consumed in two places: the render
+floors a white at the MEASURED range when the fixture has one, else the material's declaration,
+else 2000 K; and a comparator judges the device against the intent clipped to the range, as it
+judges chromaticity against the intent clipped to the polygon. A material without `cct` is never
+probed (the runtime passes `ct=False`); an interruption during the two probes keeps a polygon
+already measured and declines the range with a note, since the polygon's evidence is complete;
+and `pascl gamut measure --ct-only` measures the range alone, in seconds, for a fixture whose
+polygon is on record.

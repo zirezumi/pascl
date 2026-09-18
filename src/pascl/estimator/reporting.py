@@ -25,6 +25,12 @@ no observation of its own may carry a same-model fixture's value as ``inherited`
 one model label share firmware, so on the reference fleet every unit of a label measured the
 same interval to a hundredth of a second, and a seed is exact until the fixture's own reports
 confirm or, loudly, contradict it.
+
+What this describes is a transport's reporting, which no transport promises: the reference
+installation found a third of its fleet never reports a colour at all, and its comparator now
+arms on a read-back the runtime issues after the fade (``pascl.core.settle``) rather than on
+the report this module predicts, which leaves this estimator a diagnostic of how a transport
+reports and the arm's input only on an installation that chooses to trust reports.
 """
 
 from __future__ import annotations

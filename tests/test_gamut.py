@@ -192,3 +192,22 @@ def test_vertex_deviation() -> None:
     moved = ((0.153185, 0.047547), (0.701493, 0.308293), (0.169986, 0.699992))
     assert abs(vertex_deviation(MEASURED, moved) - 0.01) < 1e-9
     assert vertex_deviation(MEASURED, ()) == float("inf")
+
+
+def test_the_ct_range_is_the_device_answers_in_kelvin_or_nothing() -> None:
+    from pascl.estimator.gamut import CT_PROBES_MIRED, ct_range_from
+
+    cool, warm = CT_PROBES_MIRED
+    assert (cool, warm) == (50, 1000)
+    # a Hue bulb: 153 and 500 mired, truncated to kelvin the way a host converts them
+    assert ct_range_from({cool: 153, warm: 500}) == (2000, 6535)
+    assert ct_range_from({cool: 250, warm: 454}) == (2202, 4000)
+    # declined: a probe unanswered, a probe echoed, an unordered pair, a value out of band
+    assert ct_range_from({cool: 153}) is None
+    assert ct_range_from({cool: 153, warm: None}) is None
+    assert ct_range_from({cool: cool, warm: 500}) is None
+    assert ct_range_from({cool: 153, warm: warm}) is None
+    assert ct_range_from({cool: 370, warm: 370}) is None
+    assert ct_range_from({cool: 500, warm: 153}) is None
+    assert ct_range_from({cool: 0, warm: 500}) is None
+    assert ct_range_from({cool: 49, warm: 500}) is None  # 20408 K: past the band

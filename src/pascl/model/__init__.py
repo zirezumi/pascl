@@ -12,12 +12,15 @@ within tolerance with no home-specific code.
 """
 
 from pascl.model.schema import (
+    KELVIN_MAX,
+    KELVIN_MIN,
     SCHEMA_VERSION,
     Gamut,
     HomeModel,
     ModelError,
     consumer_envelopes,
     dumps,
+    fixture_cct_range,
     fixture_clip,
     fixture_gamut,
     fixture_model_label,
@@ -31,12 +34,15 @@ from pascl.model.schema import (
 )
 
 __all__ = [
+    "KELVIN_MAX",
+    "KELVIN_MIN",
     "SCHEMA_VERSION",
     "Gamut",
     "HomeModel",
     "ModelError",
     "consumer_envelopes",
     "dumps",
+    "fixture_cct_range",
     "fixture_clip",
     "fixture_gamut",
     "fixture_model_label",

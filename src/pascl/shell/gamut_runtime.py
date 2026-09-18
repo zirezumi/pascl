@@ -220,6 +220,17 @@ def channel_for(
     return light, fx.transport
 
 
+def takes_ct(model: HomeModel, fixture_id: str) -> bool:
+    """Whether the fixture's material takes a colour temperature, so its range is measured
+    with its polygon; a material without ``cct`` is never sent one and carries no range."""
+    for room in model.rooms.values():
+        fx = room.fixtures.get(fixture_id)
+        if fx is not None:
+            mat = model.materials.get(fx.material)
+            return mat is not None and "cct" in mat.capabilities
+    return False
+
+
 def tick(
     model: HomeModel,
     index: Index,
@@ -270,7 +281,13 @@ def tick(
             return f"room {pick.room} became occupied"
         return None
 
-    verdict = measure(channel, allow_lit=force, clock=clk, abort_when=room_filled)
+    verdict = measure(
+        channel,
+        allow_lit=force,
+        clock=clk,
+        abort_when=room_filled,
+        ct=takes_ct(model, pick.fixture),
+    )
     if verdict is None:
         note = f"{pick.fixture} was lit by the time it was tried"
         return model, Tick(pick, notes=(note,), remaining=remaining)

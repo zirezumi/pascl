@@ -24,6 +24,10 @@ Rules the reference installation's fleet taught, each one a measurement that wen
   fixture that was off is reported as ``lit`` and the driver aborts, since the probe colours
   are on the wall from then on. A group command lights a device without any message on its
   own ``/set`` topic, so the state report is the only signal that catches every case.
+* A colour temperature is measured the same way (``command_ct``, ``color_temp`` in mireds):
+  the echo is the command's own value, a read-back is the device's, the endpoint key keeps
+  the echo on a multi-endpoint device, and a read-back showing the value from before the
+  command is ``unapplied``. The same ``/get`` answers colour and colour temperature at once.
 * The transport's identity for a device is its IEEE address, read from the retained
   ``bridge/devices`` list (``discover``), suffixed with the endpoint for a multi-endpoint
   device. A topic is a name the user can change; the address survives a rename and changes
@@ -36,11 +40,20 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Final, Protocol
 
 from pascl.core.gamut import XY
 from pascl.estimator.gamut import ECHO_TOL
 from pascl.shell.gamut_measure import Observation
+
+READ_COLOUR_PAYLOAD: Final = '{"color": {"x": "", "y": ""}}'
+"""The one ``/get`` that reads a light's colour back (``pascl.core.settle`` says when).
+
+Zigbee2MQTT answers it with ONE ZCL Read Attributes frame carrying colorMode, currentX,
+currentY and colorTemperature, and publishes the device's whole state on its base topic. Asking
+for ``color_temp`` as well doubles the frame for nothing, and asking for ``state`` alongside
+adds the on/off cluster; the settle read wants exactly this string, and a consumer that carries
+it (the reference installation's generated Jinja) is checked against it verbatim."""
 
 
 class MqttLink(Protocol):
@@ -175,6 +188,13 @@ def _xy(payload: dict[str, object], key: str) -> XY | None:
     return None
 
 
+def _mired(payload: dict[str, object], key: str) -> int | None:
+    v = payload.get(key)
+    if isinstance(v, bool) or not isinstance(v, int | float):
+        return None
+    return round(v)
+
+
 def _near(a: XY, b: XY, tol: float = ECHO_TOL) -> bool:
     return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
 
@@ -236,10 +256,14 @@ class Z2MDeviceChannel:
         self._sent: list[str] = []
         self._command: XY | None = None
         self._pre_command: XY | None = None
+        self._command_ct: int | None = None
+        self._pre_command_ct: int | None = None
         self._read_sent = False
         self._seen_unsuffixed: list[XY] = []
+        self._seen_unsuffixed_ct: list[int] = []
         self._before: dict[str, object] | None = None
         self._last_seen: XY | None = None
+        self._last_seen_ct: int | None = None
         self._lit_by_us = False
         self._watch = frozenset(watch) - {set_topic}
         self._occupancy = frozenset(occupancy)
@@ -296,7 +320,8 @@ class Z2MDeviceChannel:
         can be put back afterwards. Returns the endpoint's view of the state. One read for
         both attributes: two reads answered separately let the second answer, the resting
         colour, arrive during the first sample and pass for its answer."""
-        self._link.publish(self._get_topic, json.dumps({"state": "", "color": {"x": "", "y": ""}}))
+        payload = {"state": "", **json.loads(READ_COLOUR_PAYLOAD)}
+        self._link.publish(self._get_topic, json.dumps(payload))
         for topic, raw in self._link.drain(seconds):
             if topic != self._base:
                 continue
@@ -310,6 +335,7 @@ class Z2MDeviceChannel:
             if "state" in view:
                 self._before = view
                 self._last_seen = _xy(view, "color")
+                self._last_seen_ct = _mired(view, "color_temp")
                 return view
         return None
 
@@ -371,14 +397,25 @@ class Z2MDeviceChannel:
         payload = json.dumps({"color": {"x": xy[0], "y": xy[1]}, "transition": 0})
         self._sent.append(payload)
         self._command = xy
+        self._command_ct = None
         self._pre_command = self._last_seen
         self._read_sent = False
         self._seen_unsuffixed = []
         self._link.publish(self._set_topic, payload)
 
+    def command_ct(self, mired: int) -> None:
+        payload = json.dumps({"color_temp": mired, "transition": 0})
+        self._sent.append(payload)
+        self._command_ct = mired
+        self._command = None
+        self._pre_command_ct = self._last_seen_ct
+        self._read_sent = False
+        self._seen_unsuffixed_ct = []
+        self._link.publish(self._set_topic, payload)
+
     def read(self) -> None:
         self._read_sent = True
-        self._link.publish(self._get_topic, json.dumps({"color": {"x": "", "y": ""}}))
+        self._link.publish(self._get_topic, READ_COLOUR_PAYLOAD)
 
     def observe(self, seconds: float) -> list[Observation]:
         out: list[Observation] = []
@@ -423,6 +460,8 @@ class Z2MDeviceChannel:
         read again and to judge. On a multi-endpoint device the endpoint key keeps the echo
         throughout and only the unsuffixed key carries the read answer, taken once it has
         moved from what the sample saw before the read."""
+        if self._command_ct is not None:
+            return self._classify_ct(payload)
         cmd = self._command
         if cmd is None:
             return None
@@ -465,4 +504,49 @@ class Z2MDeviceChannel:
             and self._pre_command is not None
             and _near(value, self._pre_command)
             and not _near(value, cmd)
+        )
+
+    def _classify_ct(self, payload: dict[str, object]) -> Observation | None:
+        """The colour temperature in a state message under a ``command_ct``, by the rules of
+        :meth:`_classify` with equality in place of nearness (mireds are integers)."""
+        cmd = self._command_ct
+        if cmd is None:
+            return None
+        key = f"color_temp_{self._ep}" if self._ep else "color_temp"
+        value = _mired(payload, key)
+        if self._ep:
+            alt = _mired(payload, "color_temp")
+            if alt is not None:
+                if not self._read_sent:
+                    self._seen_unsuffixed_ct.append(alt)
+                    if value is None or value == cmd:
+                        return Observation("echo")
+                elif alt not in self._seen_unsuffixed_ct:
+                    self._last_seen_ct = alt
+                    return Observation("device", trusted=True, mired=alt)
+                elif self._unapplied_ct(alt):
+                    return Observation("unapplied", mired=alt)
+            if value is None or value == cmd:
+                return None if value is None else Observation("echo")
+            self._last_seen_ct = value
+            return Observation("device", mired=value)
+        if value is None:
+            return None
+        if not self._read_sent:
+            if value == cmd:
+                return Observation("echo")
+            if self._last_seen_ct is not None and value == self._last_seen_ct:
+                return None  # the value it already showed: not an answer to this command
+        elif self._unapplied_ct(value):
+            return Observation("unapplied", mired=value)
+        self._last_seen_ct = value
+        return Observation("device", trusted=self._read_sent, mired=value)
+
+    def _unapplied_ct(self, value: int) -> bool:
+        cmd = self._command_ct
+        return (
+            cmd is not None
+            and self._pre_command_ct is not None
+            and value == self._pre_command_ct
+            and value != cmd
         )

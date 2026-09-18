@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Final
@@ -110,6 +110,8 @@ def measure_adaptively(
     start: int = 1,
     on_launch: Callable[[str, int, int], None] | None = None,
     poll_s: float = 0.05,
+    ct: Collection[str] | None = None,
+    xy: bool = True,
 ) -> tuple[dict[str, Verdict | BaseException | None], dict[str, WindowReport]]:
     """Measure every channel, admitting fixtures per key as that key's window allows. Returns
     each fixture's verdict (None for a lit fixture not allowed, the exception when one was
@@ -117,7 +119,9 @@ def measure_adaptively(
     every launch. A fixture the measurement gave up on because its opening read-backs went
     unanswered is tried once more at the end of its key's queue, since a transport the
     window has just backed off from looks exactly like a device that is not reachable. The
-    hub carrying the channels must be running."""
+    hub carrying the channels must be running. ``ct`` names the fixtures whose colour
+    temperature range is measured too (every one when None); ``xy`` False measures the
+    ranges alone (see ``measure``)."""
     windows: dict[str, Window] = {
         k: Window(size=float(max(1, start)), ceiling=max(1, ceiling)) for k in set(keys.values())
     }
@@ -139,7 +143,14 @@ def measure_adaptively(
 
         try:
             when = (lambda: abort_when(name)) if abort_when is not None else None
-            return measure(channel, allow_lit=allow_lit, abort_when=when, on_sample=feed)
+            return measure(
+                channel,
+                allow_lit=allow_lit,
+                abort_when=when,
+                on_sample=feed,
+                ct=ct is None or name in ct,
+                xy=xy,
+            )
         except BaseException as exc:
             return exc
 

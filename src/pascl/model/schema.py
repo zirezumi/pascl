@@ -88,6 +88,11 @@ PaletteKind = Literal["solar_cct", "solar_keyframes", "solar_cct_offset", "stati
 
 XY = tuple[float, float]
 
+KELVIN_MIN = 1000
+KELVIN_MAX = 20000
+"""The widest colour-temperature range any transport declares (Zigbee's colorTemperature
+attribute spans 1000-20000 K); a measured range must sit inside it."""
+
 
 class ModelError(ValueError):
     """The model could not be loaded or does not validate. ``errors`` lists every problem."""
@@ -183,6 +188,13 @@ class Gamut:
     firmware: str | None = None
     """The device's firmware at measurement, as the transport reported it. Information for a
     reader comparing units, never a staleness trigger: a gamut does not drift."""
+    ct_range_k: tuple[int, int] | None = None
+    """The colour temperatures the device can actually show, kelvin, (floor, ceiling), measured
+    the way the polygon is: commanded past each end and read back. A transport's declared range
+    is what the device advertises, and the reference installation found 22 bulbs advertising
+    1000-20000 K over a physical 2000-6535 K; a comparator judging the device against a
+    declared range repaints such a bulb forever at night. None when unmeasured, in which case
+    :func:`fixture_cct_range` falls back to the material's declaration."""
 
 
 @dataclass(frozen=True)
@@ -491,6 +503,7 @@ _GAMUT = (
     "clip_rule",
     "inherited_from",
     "firmware",
+    "ct_range_k",
 )
 _GROUP = ("members", "tier", "transport", "address")
 _PRESENCE = ("sources", "fusion", "pir", "coalesce_ms")
@@ -600,22 +613,29 @@ def _read_material(r: _Reader, ctx: str, v: object) -> Material:
     bad = [c for c in caps if c not in get_args(Capability)]
     if bad:
         r.fail(f"{ctx}.capabilities", f"unknown capability {bad}")
-    rng = d.get("cct_range_k")
-    cct: tuple[int, int] | None = None
-    if rng is not None:
-        if isinstance(rng, list) and len(rng) == 2 and all(isinstance(x, int) for x in rng):
-            cct = (rng[0], rng[1])
-        else:
-            r.fail(f"{ctx}.cct_range_k", f"expected [min_k, max_k], got {rng!r}")
     return Material(
         kind=r.literal(f"{ctx}.kind", r.req(ctx, d, "kind"), get_args(MaterialKind), "bulb"),
         capabilities=cast(
             "frozenset[Capability]", frozenset(c for c in caps if c in get_args(Capability))
         ),
-        cct_range_k=cct,
+        cct_range_k=_read_kelvin_range(r, f"{ctx}.cct_range_k", d.get("cct_range_k")),
         calibration=r.string(f"{ctx}.calibration", d.get("calibration")),
         model=r.string(f"{ctx}.model", d.get("model")),
     )
+
+
+def _read_kelvin_range(r: _Reader, ctx: str, rng: object) -> tuple[int, int] | None:
+    """``[min_k, max_k]`` as an int pair; None when absent."""
+    if rng is None:
+        return None
+    if (
+        isinstance(rng, list)
+        and len(rng) == 2
+        and all(isinstance(x, int) and not isinstance(x, bool) for x in rng)
+    ):
+        return (rng[0], rng[1])
+    r.fail(ctx, f"expected [min_k, max_k], got {rng!r}")
+    return None
 
 
 def _read_sensor(r: _Reader, ctx: str, v: object) -> Sensor:
@@ -645,6 +665,7 @@ def _read_gamut(r: _Reader, ctx: str, v: object) -> Gamut:
         clip_rule=r.literal(f"{ctx}.clip_rule", d.get("clip_rule"), CLIP_RULES, "closest"),
         inherited_from=r.string(f"{ctx}.inherited_from", d.get("inherited_from")),
         firmware=r.string(f"{ctx}.firmware", d.get("firmware")),
+        ct_range_k=_read_kelvin_range(r, f"{ctx}.ct_range_k", d.get("ct_range_k")),
     )
 
 
@@ -941,6 +962,10 @@ def validate(m: HomeModel) -> list[str]:
             "cct" not in mat.capabilities or mat.cct_range_k is not None,
             f"materials.{mid}: a cct-capable material needs cct_range_k",
         )
+        check(
+            mat.cct_range_k is None or mat.cct_range_k[0] < mat.cct_range_k[1],
+            f"materials.{mid}: cct_range_k must be [min_k, max_k] with min below max",
+        )
     for sid, s in m.sensors.items():
         check(
             s.transport in m.transports, f"sensors.{sid}: transport '{s.transport}' is not declared"
@@ -980,6 +1005,16 @@ def validate(m: HomeModel) -> list[str]:
                 check(
                     fx.gamut.clip_rule != "rgb_clamp" or len(fx.gamut.vertices) == 3,
                     f"{fctx}.gamut: rgb_clamp is a rule for a three-primary (triangle) gamut",
+                )
+                ct = fx.gamut.ct_range_k
+                check(
+                    ct is None or KELVIN_MIN <= ct[0] < ct[1] <= KELVIN_MAX,
+                    f"{fctx}.gamut: ct_range_k must be (floor, ceiling) inside "
+                    f"{KELVIN_MIN}-{KELVIN_MAX} K",
+                )
+                check(
+                    ct is None or fx_mat is None or "cct" in fx_mat.capabilities,
+                    f"{fctx}.gamut: a ct_range_k on a material without the cct capability",
                 )
                 seed_id = fx.gamut.inherited_from
                 if seed_id is not None:
@@ -1272,6 +1307,9 @@ def to_dict(m: HomeModel) -> dict[str, Any]:
                                 "clip_rule": f.gamut.clip_rule,
                                 "inherited_from": f.gamut.inherited_from,
                                 "firmware": f.gamut.firmware,
+                                "ct_range_k": (
+                                    None if f.gamut.ct_range_k is None else list(f.gamut.ct_range_k)
+                                ),
                             }
                         }
                     ),
@@ -1439,6 +1477,20 @@ def fixture_gamut(m: HomeModel, fixture_id: str) -> tuple[XY, ...]:
     it has none or is unknown. Fixture ids are unique across rooms."""
     fx = _find_fixture(m, fixture_id)
     return () if fx is None or fx.gamut is None else fx.gamut.vertices
+
+
+def fixture_cct_range(m: HomeModel, fixture_id: str) -> tuple[int, int] | None:
+    """The colour temperatures a fixture can show, kelvin (floor, ceiling): measured with its
+    gamut when it has been, else what its material declares, else None (a fixture without
+    ``cct``, or unknown). What the render floors a colour temperature at and what a
+    comparator clips the intent to before judging the device."""
+    fx = _find_fixture(m, fixture_id)
+    if fx is None:
+        return None
+    if fx.gamut is not None and fx.gamut.ct_range_k is not None:
+        return fx.gamut.ct_range_k
+    mat = m.materials.get(fx.material)
+    return None if mat is None else mat.cct_range_k
 
 
 def fixture_clip(m: HomeModel, fixture_id: str) -> tuple[tuple[XY, ...], ClipRule]:
