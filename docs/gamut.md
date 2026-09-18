@@ -370,6 +370,16 @@ unanswered, a probe answered with its own value (the transport's echo, or a devi
 1000-20000 K), or a pair that is not an ordered range inside 1000-20000 K yields `None`, with
 the evidence in the verdict's notes.
 
+One thing the polygon protocol never met: a Hue bulb clips an xy while off but stores a colour
+temperature UNCLIPPED while off, and clips it only while the emitter is lit (all 22 placeholder
+bulbs on the reference installation answered 50 and 1000 to the two probes while dark, and 501
+to a lit 678). So the range of such a device cannot be measured invisibly. In the invisible
+mode the answer-equals-probe case is declined by name (`CT_DECLINED`, `CT_STORED_WHILE_OFF`);
+in the forced mode the driver switches the dark fixture on at the first such answer, takes both
+probes again lit (a second or two of the device's coolest then warmest white), and `restore`
+puts the colour back before switching it off, the machinery the polygon protocol already has
+for a device that keeps its colour while off.
+
 The range travels like the polygon (a seed copies it) and is consumed in two places: the render
 floors a white at the MEASURED range when the fixture has one, else the material's declaration,
 else 2000 K; and a comparator judges the device against the intent clipped to the range, as it

@@ -11,6 +11,8 @@ from pascl.clock import ManualClock
 from pascl.core.gamut import XY, Polygon, project
 from pascl.shell.gamut_measure import (
     ANSWER_TIMEOUT,
+    CT_DECLINED,
+    CT_STORED_WHILE_OFF,
     DIAGNOSE_AFTER,
     MAX_READS,
     NEVER_SETTLES,
@@ -182,6 +184,45 @@ def test_the_colour_temperature_range_has_its_own_switches_and_declines_honestly
     dev = FakeDevice(clock, TRIANGLE, lit_at=3)
     v = measure(dev, clock=clock)
     assert v is not None and v.aborted is not None and dev.ct_commands == 0
+
+
+class StoresCtWhileOff(FakeDevice):
+    """A Hue bulb: an xy is clipped to the gamut whether lit or not, but a colour temperature
+    is stored UNCLIPPED while off and clipped only while the emitter is lit. The reference
+    installation's 22 placeholder-range bulbs answered 50 and 1000 to the two probes while
+    off, and 501 to a lit 678."""
+
+    def command_ct(self, mired: int) -> None:
+        super().command_ct(mired)
+        if not self.lit:
+            self.current_ct = mired
+
+
+def test_a_bulb_that_stores_a_colour_temperature_unclipped_while_off_is_measured_lit() -> None:
+    clock = _clock()
+    # invisible mode: both probes come back as sent, which is no range; declined by name
+    dev = StoresCtWhileOff(clock, TRIANGLE)
+    v = measure(dev, clock=clock)
+    assert v is not None and v.polygon is not None and v.ct_range_k is None
+    assert v.ct_answers == ((50, 50), (1000, 1000)) and dev.lit_up == 0
+    assert any(n.startswith(CT_DECLINED) and CT_STORED_WHILE_OFF in n for n in v.notes)
+    # forced mode: the first probe's own value switches the bulb on and both probes are
+    # retaken lit; the polygon stage never lit it (it clips xy while off), the range stage did
+    dev = StoresCtWhileOff(clock, TRIANGLE)
+    v = measure(dev, allow_lit=True, clock=clock)
+    assert v is not None and v.polygon is not None and v.ct_range_k == (2000, 6535)
+    assert v.ct_answers == ((50, 153), (1000, 500)) and dev.lit_up == 1
+    assert dev.ct_commands == 3  # one dark probe, then two lit
+    assert any("switched on for the colour temperature probes" in n for n in v.notes)
+    assert dev.restored
+    # the range alone, forced, on a dark bulb: the same light-up
+    dev = StoresCtWhileOff(clock, TRIANGLE)
+    v = measure(dev, allow_lit=True, clock=clock, xy=False)
+    assert v is not None and v.ct_range_k == (2000, 6535) and dev.lit_up == 1
+    # already lit: measured as it is, no switch
+    dev = StoresCtWhileOff(clock, TRIANGLE, lit=True)
+    v = measure(dev, allow_lit=True, clock=clock, xy=False)
+    assert v is not None and v.ct_range_k == (2000, 6535) and dev.lit_up == 0
 
 
 def test_an_interruption_during_the_range_probes_keeps_the_polygon() -> None:

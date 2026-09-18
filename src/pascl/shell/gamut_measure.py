@@ -348,11 +348,17 @@ def take_ct_sample(
     )
 
 
+#: The reasons the range probes decline, as prefixes of the verdict's notes.
+CT_STORED_WHILE_OFF: Final = "the device stores a colour temperature unclipped while off"
+CT_DECLINED: Final = "colour temperature range declined"
+
+
 def measure_ct(
     channel: DeviceChannel,
     clock: Clock,
     *,
     allow_lit: bool = False,
+    lit: bool | None = None,
     abort_when: Callable[[], str | None] | None = None,
     on_sample: Callable[[Sample], None] | None = None,
 ) -> tuple[tuple[int, int] | None, tuple[tuple[int, int | None], ...], tuple[str, ...], str | None]:
@@ -361,10 +367,22 @@ def measure_ct(
     once. Returns the range (``ct_range_from``, None when declined), the answers, notes for
     the verdict, and the interruption that cut it short, if one did (the caller restores at
     once; the fixture is not put back here). Runs after the polygon protocol, or on its own
-    for a fixture whose polygon is already known."""
+    for a fixture whose polygon is already known.
+
+    A device that answers a probe with the probe's own value, or that does not apply it,
+    cannot be measured dark: Hue bulbs store a colour temperature UNCLIPPED while off (the
+    attribute is clipped only while the emitter is lit; the reference installation's 22
+    placeholder-range bulbs all answered 50 and 1000 to the two probes while off, and 501 to
+    a lit 678) where they clip an xy while off. In the forced mode such a fixture (``lit``
+    False) is switched on and both probes are taken again, lit, as the polygon protocol does
+    for a device that keeps its colour while off; ``restore`` turns it off again after the
+    colour is back. Otherwise the range is declined with a note naming the forced mode."""
     answers: dict[int, int | None] = {}
     notes: list[str] = []
-    for mired in CT_PROBES_MIRED:
+    lit_up = False
+    i = 0
+    while i < len(CT_PROBES_MIRED):
+        mired = CT_PROBES_MIRED[i]
         if abort_when is not None and (reason := abort_when()) is not None:
             return None, tuple(answers.items()), tuple(notes), reason
         sample = take_ct_sample(channel, mired, clock, interrupt=not allow_lit)
@@ -384,15 +402,32 @@ def measure_ct(
                 else "fixture turned on during the measurement"
             )
             return None, tuple(answers.items()), tuple(notes), reason
+        dark_answer = sample.mired == mired or (sample.mired is None and sample.unapplied)
+        if dark_answer and not lit_up and allow_lit and not lit and channel.light_up():
+            # measured lit instead, from the first probe; restore turns it off again
+            lit_up = True
+            answers.clear()
+            _wait(channel, clock, RETAKE_PAUSE)
+            i = 0
+            continue
         answers[mired] = sample.mired
         if sample.mired is None:
             what = "not applied" if sample.unapplied else "unanswered"
             notes.append(f"colour temperature probe {mired} mired {what}")
         _wait(channel, clock, PAUSE)
+        i += 1
     rng = ct_range_from(answers)
+    if lit_up:
+        notes.append(f"switched on for the colour temperature probes: {CT_STORED_WHILE_OFF}")
     if rng is None and all(v is not None for v in answers.values()):
         got = ", ".join(f"{m}->{v}" for m, v in answers.items())
-        notes.append(f"colour temperature range declined: the probes answered {got}")
+        if any(v == m for m, v in answers.items()) and not lit:
+            notes.append(
+                f"{CT_DECLINED}: the probes answered {got}; {CT_STORED_WHILE_OFF}, or the "
+                f"transport echoed; the forced mode measures it lit"
+            )
+        else:
+            notes.append(f"{CT_DECLINED}: the probes answered {got}")
     return rng, tuple(answers.items()), tuple(notes), None
 
 
@@ -496,7 +531,12 @@ def measure(
             _wait(channel, clk, PAUSE)
         if ct and aborted is None:
             ct_range, ct_answers, ct_notes, cut = measure_ct(
-                channel, clk, allow_lit=allow_lit, abort_when=abort_when, on_sample=on_sample
+                channel,
+                clk,
+                allow_lit=allow_lit,
+                lit=bool(lit) or lit_up,
+                abort_when=abort_when,
+                on_sample=on_sample,
             )
             if cut is not None:
                 ct_notes = (*ct_notes, f"colour temperature range not measured: {cut}")
